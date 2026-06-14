@@ -6,7 +6,7 @@
   <title>ValiantTMS — Cycle Chart</title>
   <script id="sap-ui-bootstrap"
     src="https://sdk.openui5.org/resources/sap-ui-core.js"
-    data-sap-ui-libs="sap.m,sap.ui.table"
+    data-sap-ui-libs="sap.m,sap.ui.table,sap.ui.layout"
     data-sap-ui-theme="sap_horizon"
     data-sap-ui-compatVersion="edge"
     data-sap-ui-async="true">
@@ -30,6 +30,20 @@
     .sapUiTableRowAlternate { border-bottom: none !important; border-top: none !important; }
     .sapUiTableCell,
     .sapUiTableCellInner    { border-bottom: none !important; border-top: none !important; }
+
+    /* Run Condition placeholder */
+    .vt-runcond-placeholder {
+      height: 150px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #fafafa;
+      border-bottom: 1px solid #e4e4e4;
+      color: #bbb;
+      font-size: 13px;
+      font-family: 72, Arial, sans-serif;
+      font-style: italic;
+    }
   </style>
 </head>
 <body class="sapUiBody">
@@ -57,6 +71,21 @@ sap.ui.getCore().attachInit(function () {
     return max;
   }
 
+  // Compute and write item.step based on tree position, mirroring the React TreeTable2 logic:
+  //   stations → S1, S2 …   children → P{parentIdx}_{k}   grandchildren → P{parentIdx}_{k}_{m} …
+  function annotateSteps(items, idxPrefix) {
+    (items || []).forEach(function (item, k) {
+      if (idxPrefix === null) {
+        item.step = "S" + (k + 1);
+        annotateSteps(item.sub_process_items, String(k + 1));
+      } else {
+        var childIdx = idxPrefix + "_" + (k + 1);
+        item.step = "P" + childIdx;
+        annotateSteps(item.sub_process_items, childIdx);
+      }
+    });
+  }
+
   // Annotate every item with its parent's and grandparent's cycle_end.
   // These drive the right-border markers in CycleBar, mirroring the React pattern
   // where nested divs each add a borderRight at the parent's cycle_end position.
@@ -68,8 +97,186 @@ sap.ui.getCore().attachInit(function () {
   }
 
   // ── Models ────────────────────────────────────────────────────────────────
-  var oSettingsModel = new sap.ui.model.json.JSONModel({ scaleFactor: scaleFactor });
-  var oDataModel     = new sap.ui.model.json.JSONModel({ items: [], maxCycleEnd: 0 });
+  var oSettingsModel   = new sap.ui.model.json.JSONModel({ scaleFactor: scaleFactor });
+  var oDataModel       = new sap.ui.model.json.JSONModel({ items: [], maxCycleEnd: 0 });
+  var oSelectedItemId  = null;   // item_id of the last clicked row
+
+  // ── Tree helpers ──────────────────────────────────────────────────────────
+  function findItemById(items, itemId) {
+    for (var i = 0; i < (items || []).length; i++) {
+      if (items[i].item_id === itemId) return items[i];
+      var hit = findItemById(items[i].sub_process_items, itemId);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  // ── Item click handler ────────────────────────────────────────────────────
+  window.__vtOnItemClick = function (sId) {
+    var oCtrl = sap.ui.getCore().byId(sId);
+    if (!oCtrl) return;
+    var oCtx = oCtrl.getBindingContext();
+    if (!oCtx) return;
+    var oObj = oCtx.getObject();
+    oSelectedItemId = oObj.item_id;
+    console.log("[ValiantTMS] item_dict:", oObj);
+  };
+
+  // ── Add Process ───────────────────────────────────────────────────────────
+  function addNewProcess() {
+    var items      = oDataModel.getProperty("/items");
+    var currItem   = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
+
+    if (!currItem) {
+      sap.m.MessageToast.show("Click a row first to select a parent");
+      return;
+    }
+
+    if (!Array.isArray(currItem.sub_process_items)) {
+      currItem.sub_process_items = [];
+    }
+
+    var lastItem = currItem.sub_process_items.length > 0
+      ? currItem.sub_process_items[currItem.sub_process_items.length - 1]
+      : null;
+
+    var newItem = {
+      id:              "",
+      item_id:         crypto.randomUUID(),
+      tree_index:      lastItem ? lastItem.tree_index + 1 : 0,
+      step:            "",
+      op_number:       currItem.op_number,
+      title:           "New_Process -------------",
+      parent_id:       currItem.item_id,
+      subprocess:      "",
+      run_cond_config: lastItem
+        ? JSON.stringify({
+            Start: { "After...": [lastItem.item_id], Offset: [0.0] },
+            Cycle: { "Parent Process": [] },
+            End:   { "": [], Offset: [0.0] }
+          })
+        : "{}",
+      dependant_items:  JSON.stringify({ Start: [], Cycle: [], End: [] }),
+      cycle_start:      1,
+      cycle_time:       10,
+      cycle_end:        1,
+      color:            "#09528A",
+      cycle_type:       "",
+      highlight:        "",
+      sub_process_items: []
+    };
+
+    currItem.sub_process_items.push(newItem);
+    annotateSteps(items, null);
+    annotateAncestors(items, []);
+    oDataModel.refresh(true);
+    oSelectedItemId = newItem.item_id;
+    sap.m.MessageToast.show("Process added — double-click to rename, then Save");
+  }
+
+  // ── Inline title rename helpers ──────────────────────────────────────────
+  // Walk the nested model tree and update title by item_id.
+  // Returns the updated item so we can confirm the change is in the payload.
+  function findAndUpdateTitle(items, itemId, newTitle) {
+    for (var i = 0; i < (items || []).length; i++) {
+      if (items[i].item_id === itemId) {
+        items[i].title = newTitle;
+        return items[i];
+      }
+      var found = findAndUpdateTitle(items[i].sub_process_items, itemId, newTitle);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function saveTitleToDb() {
+    var items   = oDataModel.getProperty("/items");
+    var op      = oOpSelect.getSelectedKey();
+    var payload = { updated_db: items, op_number: op };
+    console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length);
+
+    fetch(API_BASE + "/updateDB", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload)
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (resp) {
+        console.log("[ValiantTMS] /updateDB response:", resp);
+        sap.m.MessageToast.show("Title saved");
+      })
+      .catch(function (err) {
+        console.error("[ValiantTMS] /updateDB error:", err);
+        sap.m.MessageToast.show("Save failed: " + err.message);
+      });
+  }
+
+  window.__vtOnItemDblClick = function (sId) {
+    var oCtrl = sap.ui.getCore().byId(sId);
+    if (!oCtrl) return;
+    var oCtx = oCtrl.getBindingContext();
+    if (!oCtx) return;
+
+    var oSpan = document.getElementById(sId);
+    if (!oSpan || oSpan.querySelector("input")) return;
+
+    // Capture item_id and raw title at click time.
+    // We do NOT rely on getObject() as a live ref — TreeTable's ClientTreeBindingAdapter
+    // may return a node wrapper, not the actual model object.
+    var oObj     = oCtx.getObject();
+    var itemId   = oObj.item_id;
+    var rawTitle = oObj.title || "";
+
+    var oInput = document.createElement("input");
+    oInput.type = "text";
+    oInput.value = rawTitle;
+    oInput.style.cssText =
+      "width:90%;border:1px solid #09528A;border-radius:3px;" +
+      "padding:2px 6px;font-size:13px;font-family:72,Arial,sans-serif;" +
+      "outline:none;background:#fff;color:#32363a;";
+
+    oSpan.textContent = "";
+    oSpan.appendChild(oInput);
+    oInput.focus();
+    oInput.select();
+
+    var committed = false;
+
+    function commit() {
+      if (committed) return;
+      committed = true;
+      var newTitle = oInput.value.trim();
+      if (newTitle && newTitle !== rawTitle) {
+        // Update the item inside the real model data by item_id
+        var items   = oDataModel.getProperty("/items");
+        var updated = findAndUpdateTitle(items, itemId, newTitle);
+        if (updated) {
+          console.log("[ValiantTMS] Model updated:", itemId, "→", newTitle);
+          oDataModel.refresh(true);  // push change to all bound controls (no DB save yet)
+        } else {
+          console.warn("[ValiantTMS] item_id not found in model:", itemId);
+          oCtrl.invalidate();
+        }
+      } else {
+        oCtrl.invalidate();
+      }
+    }
+
+    function cancel() {
+      if (committed) return;
+      committed = true;
+      oCtrl.invalidate();
+    }
+
+    oInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter")  { e.preventDefault(); e.stopPropagation(); commit(); }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancel(); }
+    });
+    oInput.addEventListener("blur", cancel);
+  };
 
   // ── Custom CycleBar control ───────────────────────────────────────────────
   //   Mirrors the React ProgressBar rules:
@@ -122,12 +329,14 @@ sap.ui.getCore().attachInit(function () {
       // Root container — explicit px height required (% resolves to 0 in table cells)
       oRm.write('<div');
       oRm.writeControlData(oCtrl);
+      oRm.writeAttribute("onclick", "window.__vtOnItemClick('" + oCtrl.getId() + "')");
       oRm.addStyle("position",    "relative");
       oRm.addStyle("width",       "100%");
       oRm.addStyle("height",      "36px");
       oRm.addStyle("display",     "flex");
       oRm.addStyle("align-items", "center");
       oRm.addStyle("overflow",    "visible");
+      oRm.addStyle("cursor",      "pointer");
       oRm.writeStyles();
       oRm.write('>');
 
@@ -183,8 +392,10 @@ sap.ui.getCore().attachInit(function () {
       var title = oCtrl.getTitle() || "";
       oRm.write('<span');
       oRm.writeControlData(oCtrl);
+      oRm.writeAttribute("onclick", "window.__vtOnItemClick('" + oCtrl.getId() + "')");
+      oRm.writeAttribute("ondblclick", "event.stopPropagation();window.__vtOnItemDblClick('" + oCtrl.getId() + "')");
       oRm.write(' style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' +
-                'display:block;line-height:36px;font-size:13px;' +
+                'display:block;line-height:36px;font-size:13px;cursor:pointer;' +
                 'color:' + color + ';font-weight:' + fw + ';padding-left:' + pl + ';"' +
                 ' title="' + title + '">');
       oRm.writeEscaped(title);
@@ -258,7 +469,16 @@ sap.ui.getCore().attachInit(function () {
     columns: [
       new sap.ui.table.Column({
         label:     new sap.m.Label({ text: "Cycle Description" }),
-        template:  new TitleCell({ title: "{title}", cycleType: "{cycle_type}", color: "{color}" }),
+        template:  new TitleCell({
+                     title: {
+                       parts:     [{ path: "step" }, { path: "title" }],
+                       formatter: function (step, title) {
+                         return (step ? step + " > " : "") + (title || "");
+                       }
+                     },
+                     cycleType: "{cycle_type}",
+                     color:     "{color}"
+                   }),
         width:     "220px",
         resizable: true
       }),
@@ -334,6 +554,7 @@ sap.ui.getCore().attachInit(function () {
       })
       .then(function (response) {
         var items = response.data || [];
+        annotateSteps(items, null);
         annotateAncestors(items, []);
         maxCycleEnd = getMaxCycleEnd(items) || 500;
         oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
@@ -393,20 +614,61 @@ sap.ui.getCore().attachInit(function () {
     }
   });
 
-  // ── Toolbar ───────────────────────────────────────────────────────────────
-  var oToolbar = new sap.m.Toolbar({
+  // ── Legend item helper ────────────────────────────────────────────────────
+  function legendItem(color, label) {
+    return new sap.ui.core.HTML({
+      content: '<div style="display:inline-flex;align-items:center;margin-right:16px;' +
+               'font-size:11px;font-family:72,Arial,sans-serif;color:#555;">' +
+               '<span style="display:inline-block;width:22px;height:10px;background:' + color + ';' +
+               'border-radius:2px;margin-right:5px;"></span>' + label + '</div>',
+      sanitizeContent: false
+    });
+  }
+
+  // ── Job Toolbar ───────────────────────────────────────────────────────────
+  var oJobToolbar = new sap.m.Toolbar({
     style: "Standard",
     content: [
+      new sap.m.Button({
+        icon:  "sap-icon://factory",
+        text:  "Job",
+        type:  "Transparent",
+        press: function () { /* TODO: open job dialog */ }
+      }),
+      new sap.m.ToolbarSeparator(),
       new sap.m.Label({ text: "Operation:" }),
       new sap.m.ToolbarSpacer({ width: "6px" }),
       oOpSelect,
-      new sap.m.ToolbarSeparator(),
+      new sap.m.Button({ icon: "sap-icon://add-circle", type: "Transparent", tooltip: "Add Op" }),
+      new sap.m.Button({ icon: "sap-icon://edit",       type: "Transparent", tooltip: "Edit Op" }),
+      new sap.m.Button({ icon: "sap-icon://copy",       type: "Transparent", tooltip: "Duplicate Op" }),
+      new sap.m.Button({ icon: "sap-icon://delete",     type: "Transparent", tooltip: "Delete Op" }),
+      new sap.m.ToolbarSpacer(),
+      new sap.m.Button({
+        icon:  "sap-icon://save",
+        text:  "Save",
+        type:  "Emphasized",
+        press: function () { saveTitleToDb(); }
+      })
+    ]
+  });
+
+  // ── Run Condition Toolbar (placeholder) ───────────────────────────────────
+  var oRunCondPlaceholder = new sap.ui.core.HTML({
+    content:         '<div class="vt-runcond-placeholder">Run Condition Toolbar — coming soon</div>',
+    sanitizeContent: false
+  });
+
+  // ── Tree Design Toolbar ───────────────────────────────────────────────────
+  var oTreeDesignToolbar = new sap.m.Toolbar({
+    style: "Standard",
+    content: [
       new sap.m.Label({ text: "Scale:" }),
       new sap.m.ToolbarSpacer({ width: "6px" }),
       oSlider,
       new sap.m.ToolbarSpacer({ width: "6px" }),
       oScaleLabel,
-      new sap.m.ToolbarSpacer(),
+      new sap.m.ToolbarSeparator(),
       new sap.m.Button({
         icon:    "sap-icon://expand-all",
         type:    "Transparent",
@@ -418,39 +680,85 @@ sap.ui.getCore().attachInit(function () {
         type:    "Transparent",
         tooltip: "Collapse All",
         press:   function () { oTable.collapseAll(); }
-      })
+      }),
+      new sap.m.ToolbarSeparator(),
+      new sap.m.Button({
+        icon:    "sap-icon://add",
+        type:    "Accept",
+        tooltip: "Add Process",
+        press:   function () { addNewProcess(); }
+      }),
+      new sap.m.Button({
+        icon:    "sap-icon://delete",
+        type:    "Reject",
+        tooltip: "Remove Process",
+        press:   function () { /* TODO: remove process */ }
+      }),
+      new sap.m.ToolbarSpacer(),
+      legendItem("brown",   "Station"),
+      legendItem("#1A7FC4", "Process group"),
+      legendItem("#4BA9E0", "Step"),
+      new sap.m.ToolbarSpacer({ width: "8px" })
     ]
   });
 
-  // ── Legend (footer) ───────────────────────────────────────────────────────
-  function legendItem(color, label) {
-    return new sap.ui.core.HTML({
-      content: '<div style="display:inline-flex;align-items:center;margin-right:16px;' +
-               'font-size:11px;font-family:72,Arial,sans-serif;color:#555;">' +
-               '<span style="display:inline-block;width:22px;height:10px;background:' + color + ';' +
-               'border-radius:2px;margin-right:5px;"></span>' + label + '</div>',
-      sanitizeContent: false
-    });
-  }
+  // ── Design Tab: FixFlex so table fills remaining height ───────────────────
+  var oDesignLayout = new sap.ui.layout.FixFlex({
+    vertical:    true,
+    fixContent:  [oJobToolbar, oRunCondPlaceholder, oTreeDesignToolbar],
+    flexContent: oTable
+  });
 
-  var oLegend = new sap.m.Toolbar({
-    style: "Clear",
-    content: [
-      new sap.m.ToolbarSpacer(),
-      legendItem("#09528A", "Station"),
-      legendItem("#1A7FC4", "Process group"),
-      legendItem("#4BA9E0", "Step (Undefined)"),
-      new sap.m.ToolbarSpacer()
-    ]
+  // ── Tab Bar ───────────────────────────────────────────────────────────────
+  var oIconTabBar = new sap.m.IconTabBar({
+    expandable:           false,
+    stretchContentHeight: true,
+    selectedKey:          "design",
+    items: [
+      new sap.m.IconTabFilter({
+        key: "home", text: "Home",
+        content: [new sap.ui.core.HTML({
+          content:         '<div style="padding:48px;color:#aaa;font-family:72,Arial,sans-serif;font-size:15px;">Home — coming soon</div>',
+          sanitizeContent: false
+        })]
+      }),
+      new sap.m.IconTabFilter({
+        key: "design", text: "Design",
+        content: [oDesignLayout]
+      }),
+      new sap.m.IconTabFilter({
+        key: "plots", text: "Plots",
+        content: [new sap.ui.core.HTML({
+          content:         '<div style="padding:48px;color:#aaa;font-family:72,Arial,sans-serif;font-size:15px;">Plots — coming soon</div>',
+          sanitizeContent: false
+        })]
+      }),
+      new sap.m.IconTabFilter({
+        key: "reports", text: "Reports",
+        content: [new sap.ui.core.HTML({
+          content:         '<div style="padding:48px;color:#aaa;font-family:72,Arial,sans-serif;font-size:15px;">Reports — coming soon</div>',
+          sanitizeContent: false
+        })]
+      })
+    ],
+    select: function (oEvent) {
+      if (oEvent.getParameter("key") === "design") {
+        setTimeout(function () { oTable.invalidate(); }, 0);
+      }
+    }
   });
 
   // ── Page / App ────────────────────────────────────────────────────────────
   var oPage = new sap.m.Page({
-    title:         "ValiantTMS — Cycle Chart",
+    title:         "ValiantTMS — Cycle Chart Management",
     showNavButton: false,
-    subHeader:     oToolbar,
-    content:       [oTable],
-    footer:        oLegend
+    headerContent: [
+      new sap.ui.core.HTML({
+        content:         '<img src="https://www.valianttms.com/wp-content/uploads/2021/09/valianttms-logo-298x92-1.png" height="36" style="vertical-align:middle;display:block;" />',
+        sanitizeContent: false
+      })
+    ],
+    content: [oIconTabBar]
   });
 
   new sap.m.App({ pages: [oPage] }).placeAt("content");

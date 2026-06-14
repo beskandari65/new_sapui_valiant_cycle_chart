@@ -19,7 +19,7 @@ app = Flask(__name__)
 # Set DB_PATH to your .db or .sqlite file to use a real database.
 # Leave as None to use the embedded sample data below.
 DB_PATH    = None   # e.g. r"C:\path\to\your\chart.db"
-TABLE_NAME = "cycle_chart_items"   # adjust to your actual table name
+TABLE_NAME = "cycle_general_structure"   # actual table name from the PyQt6 app
 
 # ── Sample data ───────────────────────────────────────────────────────────────
 SAMPLE_DATA = [
@@ -281,6 +281,55 @@ def api_tree():
     tree = build_tree(records)
     max_end = max((r.get("cycle_end") or 0.0 for r in records), default=0.0)
     return jsonify({"items": tree, "maxCycleEnd": max_end})
+
+
+@app.route("/updateDB", methods=["POST"])
+def api_update_db():
+    data       = request.get_json() or {}
+    updated_db = data.get("updated_db", [])
+    op_number  = data.get("op_number", "")
+
+    # Flatten nested tree → flat list of DB records
+    flat = []
+    def flatten(items):
+        for item in (items or []):
+            flat.append({k: v for k, v in item.items()
+                         if k not in ("sub_process_items", "nodes", "_ancestorEnds")})
+            flatten(item.get("sub_process_items") or item.get("nodes") or [])
+    flatten(updated_db)
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        for record in flat:
+            item_id = record.get("item_id")
+            if not item_id:
+                continue
+            cols = [c for c in record if c != "item_id"]
+            if not cols:
+                continue
+            set_clause = ", ".join(c + " = ?" for c in cols)
+            values     = [record[c] for c in cols] + [item_id]
+            cur.execute(
+                "UPDATE " + TABLE_NAME + " SET " + set_clause + " WHERE item_id = ?",
+                values
+            )
+        conn.commit()
+        conn.close()
+    else:
+        # Update in-memory sample data so changes survive the session
+        by_id = {r["item_id"]: r for r in SAMPLE_DATA}
+        for record in flat:
+            item_id = record.get("item_id")
+            if item_id and item_id in by_id:
+                by_id[item_id].update(record)
+
+    return jsonify({
+        "request_title": "updated_db",
+        "status":        "success",
+        "data":          [],
+        "message":       "Updated {} record(s) for {}".format(len(flat), op_number)
+    })
 
 
 if __name__ == "__main__":
