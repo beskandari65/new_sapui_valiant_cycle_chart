@@ -25,25 +25,28 @@
       padding: 0 !important;
     }
 
+    /* Selected row highlight — covers row-header, fixed column, and all scrollable columns */
+    tr.sapUiTableRow.vtSelectedRow > td,
+    .sapUiTableRowHdrScr .sapUiTableRowHdr.vtSelectedRow { background-color: rgba(9,82,138,0.13) !important; }
+    /* RC wait-mode target row highlight */
+    tr.sapUiTableRow.vtWaitSelectedRow > td,
+    .sapUiTableRowHdrScr .sapUiTableRowHdr.vtWaitSelectedRow { background-color: rgba(0,150,80,0.15) !important; outline: 1px solid rgba(0,150,80,0.4); }
+
+    /* RC phase panels */
+    .vtRcPanel { margin: 4px 8px 4px 0; width: 210px; }
+    .vtRcPanel .sapMPanelContent { padding: 6px 8px !important; }
+    .vtRcPanel .sapMVBox > * { margin-bottom: 4px; }
+    .vtRcPanel .sapMHBox { align-items: center; }
+    /* Panel header toolbar (CheckBox title row) */
+    .vtRcPanel .sapMPanelHdrToolbar { min-height: 32px; background: rgba(0,0,0,0.04); border-bottom: 1px solid rgba(0,0,0,0.08); }
+    .vtRcPanel .sapMPanelHdrToolbar .sapMCb { margin: 0; font-weight: 600; }
+
     /* Remove horizontal row separator lines */
     .sapUiTableRow,
     .sapUiTableRowAlternate { border-bottom: none !important; border-top: none !important; }
     .sapUiTableCell,
     .sapUiTableCellInner    { border-bottom: none !important; border-top: none !important; }
 
-    /* Run Condition placeholder */
-    .vt-runcond-placeholder {
-      height: 150px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #fafafa;
-      border-bottom: 1px solid #e4e4e4;
-      color: #bbb;
-      font-size: 13px;
-      font-family: 72, Arial, sans-serif;
-      font-style: italic;
-    }
   </style>
 </head>
 <body class="sapUiBody">
@@ -96,10 +99,337 @@ sap.ui.getCore().attachInit(function () {
     });
   }
 
+  // ── RC Condition constants ─────────────────────────────────────────────────
+  var RC_COND = {
+    FIRST_STATION:   'First Station',
+    AFTER:           'After...',
+    FROM_ZERO:       'From Zero',
+    WITH:            'With ...',
+    WITH_OFFSET:     'With offset',
+    BEFORE:          'Before ...',
+    LAST:            'Last process',
+    CUSTOM_VALUE:    'Custom value',
+    SUBPROCESS:      'Parent Process',
+    EQUAL_TO:        'Equal to',
+    SEQUENTIAL:      'Sequential',
+    SYNC_START:      'Sync Start',
+    SYNC_COMPLETION: 'Sync Completion'
+  };
+
+  // ── RC parse / serialize ───────────────────────────────────────────────────
+  // RC JSON format per phase: { "<ConditionName>": [values...], "Offset": [0.0] }
+  function parseRC(rcStr) {
+    var result = { start: null, cycle: null, end: null };
+    if (!rcStr || rcStr === '{}') return result;
+    var json;
+    try { json = JSON.parse(rcStr); } catch (e) { return result; }
+
+    function parsePhase(obj) {
+      if (!obj) return null;
+      var condition = null, values = [], offset = 0.0;
+      Object.keys(obj).forEach(function (k) {
+        if (k === 'Offset') { offset = parseFloat(obj[k][0]) || 0.0; }
+        else                { condition = k; values = obj[k] || []; }
+      });
+      return condition ? { condition: condition, values: values, offset: offset } : null;
+    }
+
+    result.start = parsePhase(json['Start']);
+    result.cycle = parsePhase(json['Cycle']);
+    result.end   = parsePhase(json['End']);
+    return result;
+  }
+
+  function serializeRC(rc) {
+    var json = {};
+    if (rc.start && rc.start.condition) {
+      var s = {}; s[rc.start.condition] = rc.start.values; s['Offset'] = [rc.start.offset || 0.0];
+      json['Start'] = s;
+    }
+    if (rc.cycle && rc.cycle.condition) {
+      var c = {}; c[rc.cycle.condition] = rc.cycle.values;
+      json['Cycle'] = c;
+    }
+    if (rc.end && rc.end.condition) {
+      var e = {}; e[rc.end.condition] = rc.end.values; e['Offset'] = [rc.end.offset || 0.0];
+      json['End'] = e;
+    }
+    return JSON.stringify(json);
+  }
+
+  // ── Flat map: item_id → item reference ────────────────────────────────────
+  function buildFlatMap(items, map) {
+    (items || []).forEach(function (item) {
+      map[item.item_id] = item;
+      buildFlatMap(item.sub_process_items, map);
+    });
+    return map;
+  }
+
+  // ── Rounding helper ────────────────────────────────────────────────────────
+  function r2(v) { return Math.round(v * 100) / 100; }
+
+  // ── Special-cases handler (mirrors handle_run_condition_special_cases) ─────
+  //   Must run before phase calculations so RC is correct for the current item.
+  function handleSpecialCases(item) {
+    var children = item.sub_process_items || [];
+    var rc = parseRC(item.run_cond_config);
+
+    if (children.length > 0) {
+      // Force Cycle phase to "Parent Process"
+      rc.cycle = { condition: RC_COND.SUBPROCESS, values: [] };
+      item.run_cond_config = serializeRC(rc);
+
+      // cycle_type
+      item.cycle_type = (item.step && item.step[0] === 'S') ? 'Station' : 'Process group';
+
+      // Force first child's Start to "From Zero"
+      var firstChild = children[0];
+      var childRc = parseRC(firstChild.run_cond_config);
+      childRc.start = { condition: RC_COND.FROM_ZERO, values: [], offset: 0.0 };
+      firstChild.run_cond_config = serializeRC(childRc);
+
+    } else {
+      // Leaf that lost its children: reset Cycle from "Parent Process" → "Custom value" 10
+      if (item.step && item.step[0] !== 'S' && rc.cycle && rc.cycle.condition === RC_COND.SUBPROCESS) {
+        rc.cycle = { condition: RC_COND.CUSTOM_VALUE, values: [10] };
+        item.run_cond_config = serializeRC(rc);
+      }
+      if (!item.step || item.step[0] !== 'S') {
+        item.cycle_type = 'Undefined';
+      }
+    }
+  }
+
+  // ── Phase calculators ──────────────────────────────────────────────────────
+  function calcStartPhase(item, startRc, flatMap) {
+    var cond   = startRc.condition;
+    var vals   = startRc.values;
+    var offset = startRc.offset || 0.0;
+
+    if (cond === RC_COND.FIRST_STATION) {
+      item.cycle_start = 0.0;
+
+    } else if (cond === RC_COND.CUSTOM_VALUE) {
+      var v = parseFloat(vals[0]);
+      if (!isNaN(v)) item.cycle_start = r2(v + offset);
+
+    } else if (cond === RC_COND.FROM_ZERO) {
+      var parent = flatMap[item.parent_id];
+      if (parent) item.cycle_start = r2((parent.cycle_start || 0.0) + offset);
+
+    } else if (cond === RC_COND.AFTER || cond === RC_COND.SEQUENTIAL) {
+      var maxEnd = 0.0;
+      vals.forEach(function (id) {
+        var ref = flatMap[id];
+        if (ref && (ref.cycle_end || 0) > maxEnd) maxEnd = ref.cycle_end;
+      });
+      if (maxEnd > 0) item.cycle_start = r2(maxEnd + offset);
+
+    } else if (cond === RC_COND.WITH || cond === RC_COND.SYNC_START || cond === RC_COND.WITH_OFFSET) {
+      var ref = flatMap[vals[vals.length - 1]];
+      if (ref) item.cycle_start = r2((ref.cycle_start || 0.0) + offset);
+    }
+  }
+
+  function calcCyclePhase(item, cycleRc, flatMap) {
+    var cond = cycleRc.condition;
+    var vals = cycleRc.values;
+
+    if (cond === RC_COND.CUSTOM_VALUE) {
+      var v = parseFloat(vals[0]);
+      if (!isNaN(v)) item.cycle_time = r2(v);
+
+    } else if (cond === RC_COND.EQUAL_TO) {
+      var ref = flatMap[vals[vals.length - 1]];
+      if (ref && ref.cycle_time != null) item.cycle_time = r2(ref.cycle_time);
+
+    } else if (cond === RC_COND.SUBPROCESS) {
+      var children = item.sub_process_items || [];
+      if (!children.length) return;
+
+      var firstStart = (children[0].cycle_start != null) ? children[0].cycle_start : (item.cycle_start || 0.0);
+      var maxEnd = 0.0;
+      children.forEach(function (ch) {
+        if (ch.cycle_end != null && ch.cycle_end > maxEnd) maxEnd = ch.cycle_end;
+      });
+
+      if (maxEnd > 0) {
+        item.cycle_time = r2(maxEnd - firstStart);
+        // If End phase is also explicitly set, back-calculate cycle_start
+        var rc = parseRC(item.run_cond_config);
+        if (rc.end && rc.end.condition) {
+          item.cycle_start = r2((item.cycle_end || 0.0) - item.cycle_time);
+        }
+        calcThirdValue(item, 'end');
+      }
+    }
+  }
+
+  function calcEndPhase(item, endRc, flatMap) {
+    var cond   = endRc.condition;
+    var vals   = endRc.values;
+    var offset = endRc.offset || 0.0;
+
+    if (cond === RC_COND.CUSTOM_VALUE) {
+      var v = parseFloat(vals[0]);
+      if (!isNaN(v)) item.cycle_end = r2(v + offset);
+
+    } else if (cond === RC_COND.BEFORE) {
+      var minStart = Infinity;
+      vals.forEach(function (id) {
+        var ref = flatMap[id];
+        if (ref && (ref.cycle_start || 0) < minStart) minStart = ref.cycle_start;
+      });
+      if (minStart !== Infinity) item.cycle_end = r2(minStart + offset);
+
+    } else if (cond === RC_COND.LAST) {
+      var parent = flatMap[item.parent_id];
+      if (parent && parent.cycle_end != null) item.cycle_end = r2(parent.cycle_end + offset);
+
+    } else if (cond === RC_COND.WITH || cond === RC_COND.SYNC_COMPLETION) {
+      var maxEnd = 0.0;
+      vals.forEach(function (id) {
+        var ref = flatMap[id];
+        if (ref && (ref.cycle_end || 0) > maxEnd) maxEnd = ref.cycle_end;
+      });
+      if (maxEnd > 0) item.cycle_end = r2(maxEnd + offset);
+    }
+  }
+
+  // ── Third value resolver (mirrors calculate_the_third_time_value) ──────────
+  function calcThirdValue(item, phase) {
+    var cs = item.cycle_start || 0.0;
+    var ct = item.cycle_time  || 0.0;
+    var ce = item.cycle_end   || 0.0;
+
+    if (phase === 'end') {
+      var v = r2(cs + ct); if (v >= 0) item.cycle_end   = v;
+    } else if (phase === 'start') {
+      var v = r2(ce - ct); item.cycle_start = v >= 0 ? v : 0.0;
+    } else if (phase === 'cycle') {
+      var v = r2(ce - cs); item.cycle_time  = v >= 0 ? v : 0.0;
+    }
+  }
+
+  // ── Per-item calculation (mirrors calculate_cycle_time_values_2) ───────────
+  function calculateItemValues(item, flatMap) {
+    var rc = parseRC(item.run_cond_config);
+    var thirdPhase = [];
+
+    if (!rc.start || !rc.start.condition) { thirdPhase.push('start'); }
+    else { calcStartPhase(item, rc.start, flatMap); }
+
+    if (!rc.cycle || !rc.cycle.condition) { thirdPhase.push('cycle'); }
+    else { calcCyclePhase(item, rc.cycle, flatMap); }
+
+    if (!rc.end || !rc.end.condition) { thirdPhase.push('end'); }
+    else { calcEndPhase(item, rc.end, flatMap); }
+
+    if (thirdPhase.length === 1) { calcThirdValue(item, thirdPhase[0]); }
+  }
+
+  // ── Recursive handler (mirrors handle_process_calculations_2) ─────────────
+  //   Two-pass: parent first → children → parent again (needed for SUBPROCESS cycle).
+  function handleProcessCalc(item, flatMap) {
+    handleSpecialCases(item);
+    calculateItemValues(item, flatMap);                          // FIRST PASS
+
+    (item.sub_process_items || []).forEach(function (child) {
+      handleProcessCalc(child, flatMap);
+    });
+
+    calculateItemValues(item, flatMap);                          // SECOND PASS
+  }
+
+  // ── Main recalc entry point (mirrors cal_and_update_run_config_values_in_db)
+  function recalcTree() {
+    var items = oDataModel.getProperty("/items");
+    if (!items || !items.length) return;
+
+    var flatMap = buildFlatMap(items, {});
+
+    // First station always anchored at t = 0
+    var firstStation = items[0];
+    var rc0 = parseRC(firstStation.run_cond_config);
+    rc0.start = { condition: RC_COND.FIRST_STATION, values: [], offset: 0.0 };
+    firstStation.run_cond_config = serializeRC(rc0);
+    firstStation.cycle_start = 0.0;
+
+    items.forEach(function (station) {
+      handleProcessCalc(station, flatMap);
+    });
+
+    annotateSteps(items, null);
+    annotateAncestors(items, []);
+    maxCycleEnd = getMaxCycleEnd(items) || 500;
+    updateGanttColumn();
+    updateRuler();
+    oDataModel.refresh(true);
+  }
+
+  // ── Sibling context helper ────────────────────────────────────────────────
+  //   Returns { siblings, idx } for a given item within its parent's children
+  //   (or the root items array if the item is a top-level station).
+  function getSiblingsContext(items, item, flatMap) {
+    var parent   = item.parent_id ? flatMap[item.parent_id] : null;
+    var siblings = parent ? (parent.sub_process_items || []) : items;
+    var idx      = -1;
+    for (var i = 0; i < siblings.length; i++) {
+      if (siblings[i].item_id === item.item_id) { idx = i; break; }
+    }
+    return { siblings: siblings, idx: idx };
+  }
+
+  // ── RC reorganizer (mirrors organize_rc_to_place_item_in_new_location) ────
+  //   Fixes the Start RC of targetItem and/or its next sibling after the tree
+  //   changes (add / remove).  Call with ignoreAbove=true when you only want
+  //   to patch the next sibling (e.g. after a deletion, pass the prev sibling).
+  function organizeRcAfterChange(items, flatMap, targetItem, ignoreAbove, ignoreBelow) {
+    var ctx      = getSiblingsContext(items, targetItem, flatMap);
+    var siblings = ctx.siblings;
+    var idx      = ctx.idx;
+    if (idx < 0) return;
+
+    if (!ignoreAbove) {
+      var prevSib = idx > 0 ? siblings[idx - 1] : null;
+      var rc = parseRC(targetItem.run_cond_config);
+      rc.start = prevSib
+        ? { condition: RC_COND.AFTER,     values: [prevSib.item_id], offset: 0.0 }
+        : { condition: RC_COND.FROM_ZERO, values: [],                offset: 0.0 };
+      rc.end = null;
+      targetItem.run_cond_config = serializeRC(rc);
+    }
+
+    if (!ignoreBelow) {
+      var nextSib = idx < siblings.length - 1 ? siblings[idx + 1] : null;
+      if (nextSib) {
+        var nextRc = parseRC(nextSib.run_cond_config);
+        nextRc.start = { condition: RC_COND.AFTER, values: [targetItem.item_id], offset: 0.0 };
+        nextRc.end   = null;
+        nextSib.run_cond_config = serializeRC(nextRc);
+      }
+    }
+  }
+
   // ── Models ────────────────────────────────────────────────────────────────
   var oSettingsModel   = new sap.ui.model.json.JSONModel({ scaleFactor: scaleFactor });
   var oDataModel       = new sap.ui.model.json.JSONModel({ items: [], maxCycleEnd: 0 });
   var oSelectedItemId  = null;   // item_id of the last clicked row
+
+  // RC interaction state
+  var oRcState = {
+    waitPhase:     null,   // 'start' | 'cycle' | 'end' — phase awaiting a target-row click
+    waitCondition: null,   // condition string to apply once target row is clicked
+    activeItemIds: []      // item_ids whose RC is currently being edited
+  };
+
+  // Which two phases are user-defined (the third is derived by recalc).
+  // Ordered by activation time (oldest first) so that when a 3rd is checked
+  // the oldest is automatically bumped out.
+  var oActivePhases = ['start', 'cycle'];
+  // Item IDs accumulated during RC wait mode; applied all at once on Enter/Apply
+  var oRcWaitSelectedIds = [];
 
   // ── Tree helpers ──────────────────────────────────────────────────────────
   function findItemById(items, itemId) {
@@ -111,21 +441,433 @@ sap.ui.getCore().attachInit(function () {
     return null;
   }
 
+  // ── Row highlight helpers ─────────────────────────────────────────────────
+  var _rowClickHandled = false;
+  var _ctrlKeyHeld     = false;
+
+  // Stamps a CSS class on BOTH the fixed-column TR and the scroll-column TR so that
+  // all columns (including the fixed "Cycle Description" column) are covered.
+  // Uses the row's actual DOM position inside its own tbody instead of the logical
+  // row index, avoiding off-by-one caused by header TRs inside the fixed tbody.
+  function _stampRowClass(oRow, i, cls, on) {
+    var tableDom = oTable.getDomRef();
+    var mainDom  = oRow.getDomRef();
+    if (!mainDom || !tableDom) return;
+    mainDom.classList.toggle(cls, on);
+
+    // Real position of this TR within its own tbody
+    var parentTbody = mainDom.parentNode;
+    var rowPos = parentTbody
+      ? Array.prototype.indexOf.call(parentTbody.children, mainDom)
+      : -1;
+    if (rowPos < 0) return;
+
+    // Find the counterpart TR in the other column container at the same tbody position
+    var inFixed    = !!mainDom.closest('.sapUiTableCtrlFixed');
+    var otherTbody = tableDom.querySelector(
+      inFixed ? '.sapUiTableCtrlScroll tbody' : '.sapUiTableCtrlFixed tbody'
+    );
+    if (otherTbody && otherTbody.rows[rowPos]) {
+      otherTbody.rows[rowPos].classList.toggle(cls, on);
+    }
+
+    // Row-header strip (expand/collapse indicator) — indexed the same as tbody rows
+    var hdrDivs = tableDom.querySelectorAll('.sapUiTableRowHdrScr .sapUiTableRowHdr');
+    if (hdrDivs[rowPos]) hdrDivs[rowPos].classList.toggle(cls, on);
+  }
+
+  function applyRowHighlight() {
+    oTable.getRows().forEach(function (oRow, i) {
+      var oCtx = oRow.getBindingContext();
+      var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
+      _stampRowClass(oRow, i, 'vtSelectedRow', !!(id && oRcState.activeItemIds.indexOf(id) >= 0));
+    });
+  }
+
+  function clearRowHighlight() {
+    oSelectedItemId = null;
+    oRcState.activeItemIds = [];
+    oActivePhases = ['start', 'cycle'];
+    cancelRcWait();
+    applyRowHighlight();
+    oRcStartSelect.setSelectedKey('');   oRcStartValueRow.setVisible(false);
+    oRcCycleSelect.setSelectedKey('');   oRcCycleValueRow.setVisible(false);
+    oRcEndSelect.setSelectedKey('');     oRcEndValueRow.setVisible(false);
+    oRcStartCheck.setSelected(true);  setPhaseControlsEnabled('start', true);
+    oRcCycleCheck.setSelected(true);  setPhaseControlsEnabled('cycle', true);
+    oRcEndCheck.setSelected(false);   setPhaseControlsEnabled('end',   false);
+  }
+
+  function applyWaitHighlights() {
+    oTable.getRows().forEach(function (oRow, i) {
+      var oCtx = oRow.getBindingContext();
+      var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
+      _stampRowClass(oRow, i, 'vtWaitSelectedRow', !!(id && oRcWaitSelectedIds.indexOf(id) >= 0));
+    });
+  }
+
   // ── Item click handler ────────────────────────────────────────────────────
   window.__vtOnItemClick = function (sId) {
+    _rowClickHandled = true;
     var oCtrl = sap.ui.getCore().byId(sId);
     if (!oCtrl) return;
     var oCtx = oCtrl.getBindingContext();
     if (!oCtx) return;
     var oObj = oCtx.getObject();
-    oSelectedItemId = oObj.item_id;
-    console.log("[ValiantTMS] item_dict:", oObj);
+
+    // While waiting for a target-item click (After.., With.., Before.., Equal To..)
+    if (oRcState.waitPhase) {
+      applyRcWithTarget(oObj.item_id);
+      return;
+    }
+
+    function setReference(item) {
+      oSelectedItemId = item.item_id;
+      var rc0 = parseRC(item.run_cond_config);
+      oActivePhases = [];
+      if (rc0.start && rc0.start.condition) oActivePhases.push('start');
+      if (rc0.cycle && rc0.cycle.condition) oActivePhases.push('cycle');
+      if (rc0.end   && rc0.end.condition)   oActivePhases.push('end');
+      if (oActivePhases.length < 1) oActivePhases = ['start', 'cycle']; // default when item has no RC yet
+      refreshRcToolbar(item);
+    }
+
+    if (_ctrlKeyHeld) {
+      // Ctrl+click: toggle this item in/out of the multi-selection
+      var idx = oRcState.activeItemIds.indexOf(oObj.item_id);
+      if (idx >= 0) {
+        oRcState.activeItemIds.splice(idx, 1);
+        if (oRcState.activeItemIds.length === 0) { clearRowHighlight(); return; }
+        if (oSelectedItemId === oObj.item_id) {
+          var fm0 = buildFlatMap(oDataModel.getProperty("/items"), {});
+          var ref0 = fm0[oRcState.activeItemIds[0]];
+          if (ref0) setReference(ref0);
+        }
+      } else {
+        oRcState.activeItemIds.push(oObj.item_id);
+        setReference(oObj);
+      }
+    } else {
+      // Normal click: select only this item (clears any prior multi-selection)
+      oRcState.activeItemIds = [oObj.item_id];
+      setReference(oObj);
+    }
+
+    applyRowHighlight();
+    console.log("[ValiantTMS] active items:", oRcState.activeItemIds);
+    console.log("[ValiantTMS] item data:", JSON.stringify(oObj, null, 2));
+    console.log("[ValiantTMS] RC JSON:", oObj.run_cond_config || '(none)');
   };
+
+  // ── RC helper functions ───────────────────────────────────────────────────
+
+  function getCurrentItem() {
+    var refId = oSelectedItemId || (oRcState.activeItemIds.length ? oRcState.activeItemIds[0] : null);
+    if (!refId) return null;
+    var flatMap = buildFlatMap(oDataModel.getProperty("/items"), {});
+    return flatMap[refId] || null;
+  }
+
+  // Patch one phase on ALL active items' RC, then recalc the whole tree.
+  // If active phases != 2, shows a warning dialog; user can still proceed.
+  function applyRcChange(phase, condition, values, offset) {
+    if (!oRcState.activeItemIds.length) { sap.m.MessageToast.show("Select a row first"); return; }
+
+    function doApply() {
+      var flatMap = buildFlatMap(oDataModel.getProperty("/items"), {});
+      oRcState.activeItemIds.forEach(function (id) {
+        var item = flatMap[id];
+        if (!item) return;
+        var rc = parseRC(item.run_cond_config);
+        rc[phase] = condition
+          ? { condition: condition, values: values || [], offset: (offset !== undefined ? parseFloat(offset) : 0.0) }
+          : null;
+        if (oActivePhases.length === 2) {
+          ['start', 'cycle', 'end'].forEach(function (p) {
+            if (!oActivePhases.includes(p)) rc[p] = null;
+          });
+        }
+        item.run_cond_config = serializeRC(rc);
+      });
+      recalcTree();
+      var updated = getCurrentItem();
+      if (updated) refreshRcToolbar(updated);
+    }
+
+    if (oActivePhases.length !== 2) {
+      sap.m.MessageBox.warning(
+        "RC calculation requires exactly 2 active phases, but " + oActivePhases.length +
+        " phase(s) are currently active.\nApply anyway?",
+        {
+          actions: [sap.m.MessageBox.Action.OK, sap.m.MessageBox.Action.CANCEL],
+          onClose: function (sAction) { if (sAction === sap.m.MessageBox.Action.OK) doApply(); }
+        }
+      );
+    } else {
+      doApply();
+    }
+  }
+
+  // Called when user clicks a row while in "waiting for target" mode.
+  function applyRcWithTarget(targetItemId) {
+    if (oRcState.activeItemIds.indexOf(targetItemId) >= 0) {
+      sap.m.MessageToast.show("Cannot reference the same item");
+      return;
+    }
+    var idx = oRcWaitSelectedIds.indexOf(targetItemId);
+    if (idx >= 0) {
+      oRcWaitSelectedIds.splice(idx, 1);  // toggle off
+    } else {
+      oRcWaitSelectedIds.push(targetItemId);
+    }
+    applyWaitHighlights();
+    var n = oRcWaitSelectedIds.length;
+    oRcStatusLabel.setText(n === 0
+      ? '→ ' + oRcState._waitText
+      : n + ' item' + (n > 1 ? 's' : '') + ' selected — Press Enter or click Apply');
+  }
+
+  function commitRcWait() {
+    if (!oRcState.waitPhase) return;
+    if (oRcWaitSelectedIds.length === 0) { sap.m.MessageToast.show("Select at least one item"); return; }
+    applyRcChange(oRcState.waitPhase, oRcState.waitCondition, oRcWaitSelectedIds.slice(), 0.0);
+    cancelRcWait();
+  }
+
+  function enterRcWait(phase, condition, text) {
+    oRcWaitSelectedIds = [];
+    oRcState.waitPhase     = phase;
+    oRcState.waitCondition = condition;
+    oRcState._waitText     = text;
+    oRcStatusLabel.setText('→ ' + text);
+    oRcStatusBar.setVisible(true);
+  }
+
+  function cancelRcWait() {
+    oRcWaitSelectedIds = [];
+    applyWaitHighlights();
+    oRcState.waitPhase     = null;
+    oRcState.waitCondition = null;
+    oRcState._waitText     = null;
+    oRcStatusLabel.setText('');
+    oRcStatusBar.setVisible(false);
+  }
+
+  // Sync all RC panel controls to the given item's current RC.
+  // oActivePhases drives checkbox states and enabled/disabled styling.
+  function refreshRcToolbar(item) {
+    if (!item) return;
+    var rc = parseRC(item.run_cond_config);
+    var sA = oActivePhases.includes('start');
+    var cA = oActivePhases.includes('cycle');
+    var eA = oActivePhases.includes('end');
+
+    oRcStartCheck.setSelected(sA);
+    oRcCycleCheck.setSelected(cA);
+    oRcEndCheck.setSelected(eA);
+    setPhaseControlsEnabled('start', sA);
+    setPhaseControlsEnabled('cycle', cA);
+    setPhaseControlsEnabled('end',   eA);
+
+    // Dropdowns always show the first (empty) item — they act as action menus.
+    // Value visibility and inputs are derived from the actual RC data.
+    oRcStartSelect.setSelectedKey('');
+    oRcCycleSelect.setSelectedKey('');
+    oRcEndSelect.setSelectedKey('');
+
+    var sk = sA && rc.start ? rc.start.condition : '';
+    oRcStartValueRow.setVisible(sk === RC_COND.CUSTOM_VALUE);
+    if (sk === RC_COND.CUSTOM_VALUE && rc.start && rc.start.values.length)
+      oRcStartValueInput.setValue(parseFloat(rc.start.values[0]) || 0);
+    oRcStartOffsetInput.setValue(sA && rc.start ? (rc.start.offset || 0) : 0);
+
+    var ck = cA && rc.cycle ? rc.cycle.condition : '';
+    oRcCycleValueRow.setVisible(ck === RC_COND.CUSTOM_VALUE);
+    if (ck === RC_COND.CUSTOM_VALUE && rc.cycle && rc.cycle.values.length)
+      oRcCycleValueInput.setValue(parseFloat(rc.cycle.values[0]) || 0);
+
+    var ek = eA && rc.end ? rc.end.condition : '';
+    oRcEndValueRow.setVisible(ek === RC_COND.CUSTOM_VALUE);
+    if (ek === RC_COND.CUSTOM_VALUE && rc.end && rc.end.values.length)
+      oRcEndValueInput.setValue(parseFloat(rc.end.values[0]) || 0);
+    oRcEndOffsetInput.setValue(eA && rc.end ? (rc.end.offset || 0) : 0);
+  }
+
+  // ── Per-phase condition handlers ──────────────────────────────────────────
+
+  function onStartConditionChanged(cond) {
+    cancelRcWait();
+    if (!oActivePhases.includes('start'))  return;
+    if (!cond)                             { applyRcChange('start', null, [], 0); return; }
+    if (!oRcState.activeItemIds.length)    { sap.m.MessageToast.show("Select a row first"); oRcStartSelect.setSelectedKey(''); return; }
+    oRcStartValueRow.setVisible(cond === RC_COND.CUSTOM_VALUE);
+    switch (cond) {
+      case RC_COND.FROM_ZERO:    applyRcChange('start', RC_COND.FROM_ZERO, [], 0);                              break;
+      case RC_COND.CUSTOM_VALUE: /* user types in Value field */                                                 break;
+      case RC_COND.SEQUENTIAL:   enterRcWait('start', RC_COND.AFTER, 'click a process to start After...');     break;
+      case RC_COND.SYNC_START:   enterRcWait('start', RC_COND.WITH,  'click a process to start With...');      break;
+      default:                   enterRcWait('start', cond, 'click a process to Start ' + cond);               break;
+    }
+  }
+
+  function onCycleConditionChanged(cond) {
+    cancelRcWait();
+    if (!oActivePhases.includes('cycle'))  return;
+    if (!cond)                             { applyRcChange('cycle', null, [], 0); return; }
+    if (!oRcState.activeItemIds.length)    { sap.m.MessageToast.show("Select a row first"); oRcCycleSelect.setSelectedKey(''); return; }
+    oRcCycleValueRow.setVisible(cond === RC_COND.CUSTOM_VALUE);
+    switch (cond) {
+      case RC_COND.CUSTOM_VALUE: /* user types in Value field */                                                 break;
+      case RC_COND.EQUAL_TO:     enterRcWait('cycle', RC_COND.EQUAL_TO, 'click a process for Equal Cycle Time'); break;
+    }
+  }
+
+  function onEndConditionChanged(cond) {
+    cancelRcWait();
+    if (!oActivePhases.includes('end'))    return;
+    if (!cond)                             { applyRcChange('end', null, [], 0); return; }
+    if (!oRcState.activeItemIds.length)    { sap.m.MessageToast.show("Select a row first"); oRcEndSelect.setSelectedKey(''); return; }
+    oRcEndValueRow.setVisible(cond === RC_COND.CUSTOM_VALUE);
+    switch (cond) {
+      case RC_COND.LAST:            applyRcChange('end', RC_COND.LAST, [], 0);                                  break;
+      case RC_COND.CUSTOM_VALUE:    /* user types in Value field */                                              break;
+      case RC_COND.SYNC_COMPLETION: enterRcWait('end', RC_COND.WITH,   'click a process to end With...');       break;
+      default:                      enterRcWait('end', cond, 'click a process to End ' + cond);                break;
+    }
+  }
+
+  // ── Phase enable / disable helpers ───────────────────────────────────────
+  function getPhaseCheckbox(phase) {
+    return phase === 'start' ? oRcStartCheck : phase === 'cycle' ? oRcCycleCheck : oRcEndCheck;
+  }
+
+  function setPhaseControlsEnabled(phase, enabled) {
+    if (phase === 'start') {
+      oRcStartSelect.setEnabled(enabled);
+      oRcStartValueInput.setEnabled(enabled);
+      oRcStartOffsetInput.setEnabled(enabled);
+    } else if (phase === 'cycle') {
+      oRcCycleSelect.setEnabled(enabled);
+      oRcCycleValueInput.setEnabled(enabled);
+    } else {
+      oRcEndSelect.setEnabled(enabled);
+      oRcEndValueInput.setEnabled(enabled);
+      oRcEndOffsetInput.setEnabled(enabled);
+    }
+  }
+
+  // Called by each panel CheckBox.
+  // Any combination of 1–3 phases is allowed; applying RC with != 2 active phases
+  // shows a warning dialog so the user can confirm or cancel.
+  function onPhaseCheckChanged(phase, checked) {
+    if (checked) {
+      if (oActivePhases.includes(phase)) return;
+      oActivePhases.push(phase);
+      setPhaseControlsEnabled(phase, true);
+      var item = getCurrentItem();
+      if (item) {
+        recalcTree();
+        var upd = getCurrentItem();
+        if (upd) refreshRcToolbar(upd);
+      }
+    } else {
+      if (oActivePhases.length <= 1) {
+        sap.m.MessageToast.show("At least 1 phase must remain active");
+        getPhaseCheckbox(phase).setSelected(true);
+        return;
+      }
+      oActivePhases.splice(oActivePhases.indexOf(phase), 1);
+      setPhaseControlsEnabled(phase, false);
+      var item = getCurrentItem();
+      if (item) {
+        var rc = parseRC(item.run_cond_config);
+        rc[phase] = null;
+        item.run_cond_config = serializeRC(rc);
+        recalcTree();
+        var upd = getCurrentItem();
+        if (upd) refreshRcToolbar(upd);
+      }
+    }
+  }
+
+  // ── Remove Process ────────────────────────────────────────────────────────
+  function collectAllItems(item) {
+    var result = [item];
+    (item.sub_process_items || []).forEach(function (child) {
+      result = result.concat(collectAllItems(child));
+    });
+    return result;
+  }
+
+  function removeItemFromTree(items, itemId) {
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].item_id === itemId) {
+        items.splice(i, 1);
+        return true;
+      }
+      if (removeItemFromTree(items[i].sub_process_items || [], itemId)) return true;
+    }
+    return false;
+  }
+
+  function removeProcess() {
+    if (!oSelectedItemId) {
+      sap.m.MessageToast.show("Click a row first to select a process to remove");
+      return;
+    }
+    var items   = oDataModel.getProperty("/items");
+    var selItem = findItemById(items, oSelectedItemId);
+    if (!selItem) {
+      sap.m.MessageToast.show("Selected item not found");
+      return;
+    }
+
+    var toDelete = collectAllItems(selItem);
+    var op       = oOpSelect.getSelectedKey();
+    var payload  = { op_number: op, data: toDelete };
+
+    fetch(API_BASE + "/removeProcess", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload)
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function () {
+        // Capture siblings context BEFORE deletion so we know who comes next
+        var flatMap0     = buildFlatMap(items, {});
+        var removedItem  = findItemById(items, oSelectedItemId);
+        var prevSibling  = null;
+        if (removedItem) {
+          var ctx0    = getSiblingsContext(items, removedItem, flatMap0);
+          prevSibling = ctx0.idx > 0 ? ctx0.siblings[ctx0.idx - 1] : null;
+        }
+
+        removeItemFromTree(items, oSelectedItemId);
+        oSelectedItemId = null;
+
+        // Patch the RC of whatever item is now after prevSibling (mirrors remove_item):
+        // if prevSibling exists → update its new next sibling's Start to After prevSibling;
+        // if no prevSibling     → handleSpecialCases will set the new first child to From Zero.
+        if (prevSibling) {
+          organizeRcAfterChange(items, buildFlatMap(items, {}), prevSibling, true, false);
+        }
+
+        recalcTree();
+        sap.m.MessageToast.show("Process removed");
+      })
+      .catch(function (err) {
+        console.error("[ValiantTMS] /removeProcess error:", err);
+        sap.m.MessageToast.show("Remove failed: " + err.message);
+      });
+  }
 
   // ── Add Process ───────────────────────────────────────────────────────────
   function addNewProcess() {
-    var items      = oDataModel.getProperty("/items");
-    var currItem   = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
+    var items    = oDataModel.getProperty("/items");
+    var currItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
 
     if (!currItem) {
       sap.m.MessageToast.show("Click a row first to select a parent");
@@ -141,37 +883,48 @@ sap.ui.getCore().attachInit(function () {
       : null;
 
     var newItem = {
-      id:              "",
-      item_id:         crypto.randomUUID(),
-      tree_index:      lastItem ? lastItem.tree_index + 1 : 0,
-      step:            "",
-      op_number:       currItem.op_number,
-      title:           "New_Process -------------",
-      parent_id:       currItem.item_id,
-      subprocess:      "",
-      run_cond_config: lastItem
-        ? JSON.stringify({
-            Start: { "After...": [lastItem.item_id], Offset: [0.0] },
-            Cycle: { "Parent Process": [] },
-            End:   { "": [], Offset: [0.0] }
-          })
-        : "{}",
+      id:               "",
+      item_id:          crypto.randomUUID(),
+      tree_index:       lastItem ? lastItem.tree_index + 1 : 0,
+      step:             "",
+      op_number:        currItem.op_number,
+      title:            "------ New_Process ------",
+      parent_id:        currItem.item_id,
+      subprocess:       "",
+      run_cond_config:  JSON.stringify({ Cycle: { "Custom value": [10] } }),
       dependant_items:  JSON.stringify({ Start: [], Cycle: [], End: [] }),
-      cycle_start:      1,
-      cycle_time:       10,
-      cycle_end:        1,
+      cycle_start:      0,
+      cycle_time:       0,
+      cycle_end:        0,
       color:            "#09528A",
-      cycle_type:       "",
+      cycle_type:       "Undefined",
       highlight:        "",
       sub_process_items: []
     };
 
     currItem.sub_process_items.push(newItem);
-    annotateSteps(items, null);
-    annotateAncestors(items, []);
-    oDataModel.refresh(true);
     oSelectedItemId = newItem.item_id;
-    sap.m.MessageToast.show("Process added — double-click to rename, then Save");
+
+    // Set Start RC (After prev sibling / From Zero) and patch next sibling if any
+    organizeRcAfterChange(items, buildFlatMap(items, {}), newItem, false, false);
+    recalcTree();
+
+    fetch(API_BASE + "/addAsSubProcess", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ item_id: currItem.item_id, new_item: newItem })
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function () {
+        sap.m.MessageToast.show("Process added — double-click to rename, then Save");
+      })
+      .catch(function (err) {
+        console.error("[ValiantTMS] /addAsSubProcess error:", err);
+        sap.m.MessageToast.show("Add failed: " + err.message);
+      });
   }
 
   // ── Inline title rename helpers ──────────────────────────────────────────
@@ -189,10 +942,21 @@ sap.ui.getCore().attachInit(function () {
     return null;
   }
 
-  function saveTitleToDb() {
+  // Strip client-side-only annotations before sending to the API.
+  function stripClientFields(items) {
+    return (items || []).map(function (item) {
+      var clean = Object.assign({}, item);
+      delete clean._ancestorEnds;
+      delete clean.step;
+      clean.sub_process_items = stripClientFields(item.sub_process_items);
+      return clean;
+    });
+  }
+
+  function saveToDb() {
     var items   = oDataModel.getProperty("/items");
     var op      = oOpSelect.getSelectedKey();
-    var payload = { updated_db: items, op_number: op };
+    var payload = { updated_db: stripClientFields(items), op_number: op };
     console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length);
 
     fetch(API_BASE + "/updateDB", {
@@ -200,18 +964,10 @@ sap.ui.getCore().attachInit(function () {
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify(payload)
     })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
-      .then(function (resp) {
-        console.log("[ValiantTMS] /updateDB response:", resp);
-        sap.m.MessageToast.show("Title saved");
-      })
-      .catch(function (err) {
-        console.error("[ValiantTMS] /updateDB error:", err);
-        sap.m.MessageToast.show("Save failed: " + err.message);
-      });
+      .then(function (r) { console.log("[ValiantTMS] /updateDB:", r.status); })
+      .catch(function (err) { console.warn("[ValiantTMS] /updateDB response error:", err.message); });
+
+    sap.m.MessageToast.show("Saved");
   }
 
   window.__vtOnItemDblClick = function (sId) {
@@ -523,12 +1279,14 @@ sap.ui.getCore().attachInit(function () {
   oTable.setModel(oSettingsModel, "settings");
   oTable.bindRows({ path: "/items", parameters: { arrayNames: ["sub_process_items"] } });
 
-  // Auto-expand to level 2 after each data load
+  // Auto-expand to level 2 after each data load; re-apply row highlight after virtual re-render
   oTable.attachRowsUpdated(function () {
     if (bAutoExpand) {
       bAutoExpand = false;
       oTable.expandToLevel(2);
     }
+    if (oRcState.activeItemIds.length) { applyRowHighlight(); }
+    if (oRcWaitSelectedIds.length) { applyWaitHighlights(); }
   });
 
   // ── Column / ruler update helpers ─────────────────────────────────────────
@@ -644,19 +1402,181 @@ sap.ui.getCore().attachInit(function () {
       new sap.m.Button({ icon: "sap-icon://copy",       type: "Transparent", tooltip: "Duplicate Op" }),
       new sap.m.Button({ icon: "sap-icon://delete",     type: "Transparent", tooltip: "Delete Op" }),
       new sap.m.ToolbarSpacer(),
+      new sap.m.ToggleButton({
+        icon:    "sap-icon://detail-view",
+        pressed: true,
+        tooltip: "Show/Hide Run Condition",
+        press:   function (oEvent) { oRcToolbar.setVisible(oEvent.getParameter("pressed")); }
+      }),
+      new sap.m.ToggleButton({
+        icon:    "sap-icon://action-settings",
+        pressed: true,
+        tooltip: "Show/Hide Design Toolbar",
+        press:   function (oEvent) { oTreeDesignToolbar.setVisible(oEvent.getParameter("pressed")); }
+      }),
+      new sap.m.ToolbarSeparator(),
       new sap.m.Button({
         icon:  "sap-icon://save",
         text:  "Save",
         type:  "Emphasized",
-        press: function () { saveTitleToDb(); }
+        press: function () { saveToDb(); }
       })
     ]
   });
 
-  // ── Run Condition Toolbar (placeholder) ───────────────────────────────────
-  var oRunCondPlaceholder = new sap.ui.core.HTML({
-    content:         '<div class="vt-runcond-placeholder">Run Condition Toolbar — coming soon</div>',
-    sanitizeContent: false
+  // ── RC Status Label ───────────────────────────────────────────────────────
+  var oRcStatusLabel = new sap.m.Label({ text: '' });
+
+  // ── Start Phase ───────────────────────────────────────────────────────────
+  var oRcStartSelect = new sap.m.Select({
+    width: '100%',
+    items: [
+      new sap.ui.core.Item({ key: '',                    text: '—' }),
+      new sap.ui.core.Item({ key: RC_COND.FROM_ZERO,    text: 'From Zero' }),
+      new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE, text: 'Custom value' }),
+      new sap.ui.core.Item({ key: RC_COND.AFTER,        text: 'After...' }),
+      new sap.ui.core.Item({ key: RC_COND.WITH,         text: 'With ...' }),
+      new sap.ui.core.Item({ key: RC_COND.SEQUENTIAL,   text: 'Sequential' }),
+      new sap.ui.core.Item({ key: RC_COND.SYNC_START,   text: 'Sync Start' })
+    ],
+    change: function (oEvent) { onStartConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
+  });
+
+  var oRcStartValueInput = new sap.m.StepInput({
+    tooltip: 'Custom Start Time (s)', value: 0, min: 0, step: 0.5,
+    displayValuePrecision: 2, width: '115px',
+    change: function () { applyRcChange('start', RC_COND.CUSTOM_VALUE, [oRcStartValueInput.getValue()], oRcStartOffsetInput.getValue()); }
+  });
+  var oRcStartValueRow = new sap.m.HBox({
+    visible: false,
+    items: [ new sap.m.Label({ text: 'Value:', width: '52px' }), oRcStartValueInput ]
+  });
+
+  var oRcStartOffsetInput = new sap.m.StepInput({
+    tooltip: 'Start Offset (s)', value: 0, step: 0.5,
+    displayValuePrecision: 2, width: '115px',
+    change: function () {
+      var item = getCurrentItem(); if (!item) return;
+      var rc = parseRC(item.run_cond_config);
+      if (rc.start && rc.start.condition)
+        applyRcChange('start', rc.start.condition, rc.start.values, oRcStartOffsetInput.getValue());
+    }
+  });
+  var oRcStartOffsetRow = new sap.m.HBox({
+    items: [ new sap.m.Label({ text: 'Offset:', width: '52px' }), oRcStartOffsetInput ]
+  });
+
+  var oRcStartCheck = new sap.m.CheckBox({
+    selected: true, text: 'Start Phase',
+    select: function (oEvent) { onPhaseCheckChanged('start', oEvent.getParameter('selected')); }
+  });
+  var oRcStartPanel = new sap.m.Panel({
+    expandable: false,
+    headerToolbar: new sap.m.Toolbar({ style: 'Clear', content: [ oRcStartCheck ] }),
+    content: [ new sap.m.VBox({ items: [ oRcStartSelect, oRcStartValueRow, oRcStartOffsetRow ] }) ]
+  }).addStyleClass('vtRcPanel');
+
+  // ── Cycle Phase ───────────────────────────────────────────────────────────
+  var oRcCycleSelect = new sap.m.Select({
+    width: '100%',
+    items: [
+      new sap.ui.core.Item({ key: '',                    text: '—' }),
+      new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE, text: 'Custom value' }),
+      new sap.ui.core.Item({ key: RC_COND.EQUAL_TO,     text: 'Equal to' })
+    ],
+    change: function (oEvent) { onCycleConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
+  });
+
+  var oRcCycleValueInput = new sap.m.StepInput({
+    tooltip: 'Cycle Time (s)', value: 10, min: 0, step: 0.5,
+    displayValuePrecision: 2, width: '115px',
+    change: function () { applyRcChange('cycle', RC_COND.CUSTOM_VALUE, [oRcCycleValueInput.getValue()], 0); }
+  });
+  var oRcCycleValueRow = new sap.m.HBox({
+    visible: false,
+    items: [ new sap.m.Label({ text: 'Value:', width: '52px' }), oRcCycleValueInput ]
+  });
+
+  var oRcCycleCheck = new sap.m.CheckBox({
+    selected: true, text: 'Cycle Phase',
+    select: function (oEvent) { onPhaseCheckChanged('cycle', oEvent.getParameter('selected')); }
+  });
+  var oRcCyclePanel = new sap.m.Panel({
+    expandable: false,
+    headerToolbar: new sap.m.Toolbar({ style: 'Clear', content: [ oRcCycleCheck ] }),
+    content: [ new sap.m.VBox({ items: [ oRcCycleSelect, oRcCycleValueRow ] }) ]
+  }).addStyleClass('vtRcPanel');
+
+  // ── End Phase ─────────────────────────────────────────────────────────────
+  var oRcEndSelect = new sap.m.Select({
+    width: '100%',
+    items: [
+      new sap.ui.core.Item({ key: '',                       text: '—' }),
+      new sap.ui.core.Item({ key: RC_COND.LAST,            text: 'Last process' }),
+      new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE,    text: 'Custom value' }),
+      new sap.ui.core.Item({ key: RC_COND.BEFORE,          text: 'Before ...' }),
+      new sap.ui.core.Item({ key: RC_COND.WITH,            text: 'With ...' }),
+      new sap.ui.core.Item({ key: RC_COND.SYNC_COMPLETION, text: 'Sync Completion' })
+    ],
+    change: function (oEvent) { onEndConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
+  });
+
+  var oRcEndValueInput = new sap.m.StepInput({
+    tooltip: 'Custom End Time (s)', value: 0, min: 0, step: 0.5,
+    displayValuePrecision: 2, width: '115px',
+    change: function () { applyRcChange('end', RC_COND.CUSTOM_VALUE, [oRcEndValueInput.getValue()], oRcEndOffsetInput.getValue()); }
+  });
+  var oRcEndValueRow = new sap.m.HBox({
+    visible: false,
+    items: [ new sap.m.Label({ text: 'Value:', width: '52px' }), oRcEndValueInput ]
+  });
+
+  var oRcEndOffsetInput = new sap.m.StepInput({
+    tooltip: 'End Offset (s)', value: 0, step: 0.5,
+    displayValuePrecision: 2, width: '115px',
+    change: function () {
+      var item = getCurrentItem(); if (!item) return;
+      var rc = parseRC(item.run_cond_config);
+      if (rc.end && rc.end.condition)
+        applyRcChange('end', rc.end.condition, rc.end.values, oRcEndOffsetInput.getValue());
+    }
+  });
+  var oRcEndOffsetRow = new sap.m.HBox({
+    items: [ new sap.m.Label({ text: 'Offset:', width: '52px' }), oRcEndOffsetInput ]
+  });
+
+  var oRcEndCheck = new sap.m.CheckBox({
+    selected: false, text: 'End Phase',
+    select: function (oEvent) { onPhaseCheckChanged('end', oEvent.getParameter('selected')); }
+  });
+  var oRcEndPanel = new sap.m.Panel({
+    expandable: false,
+    headerToolbar: new sap.m.Toolbar({ style: 'Clear', content: [ oRcEndCheck ] }),
+    content: [ new sap.m.VBox({ items: [ oRcEndSelect, oRcEndValueRow, oRcEndOffsetRow ] }) ]
+  }).addStyleClass('vtRcPanel');
+
+  // ── RC status bar: shown while waiting for a target-row click ─────────────
+  var oRcStatusBar = new sap.m.Toolbar({
+    style: 'Clear', visible: false,
+    content: [
+      oRcStatusLabel,
+      new sap.m.ToolbarSpacer(),
+      new sap.m.Button({ text: 'Apply', type: 'Emphasized', press: function () { commitRcWait(); } }),
+      new sap.m.Button({ text: 'Cancel', type: 'Transparent', press: function () { cancelRcWait(); } })
+    ]
+  });
+
+  // End phase is initially the derived phase — disable its controls at startup
+  setPhaseControlsEnabled('end', false);
+
+  // ── RC section: three GroupBox-style panels + status bar ─────────────────
+  var oRcToolbar = new sap.m.VBox({
+    items: [
+      new sap.m.FlexBox({ wrap: 'Wrap', alignItems: 'Stretch',
+        items: [ oRcStartPanel, oRcCyclePanel, oRcEndPanel ]
+      }),
+      oRcStatusBar
+    ]
   });
 
   // ── Tree Design Toolbar ───────────────────────────────────────────────────
@@ -692,7 +1612,7 @@ sap.ui.getCore().attachInit(function () {
         icon:    "sap-icon://delete",
         type:    "Reject",
         tooltip: "Remove Process",
-        press:   function () { /* TODO: remove process */ }
+        press:   function () { removeProcess(); }
       }),
       new sap.m.ToolbarSpacer(),
       legendItem("brown",   "Station"),
@@ -705,7 +1625,7 @@ sap.ui.getCore().attachInit(function () {
   // ── Design Tab: FixFlex so table fills remaining height ───────────────────
   var oDesignLayout = new sap.ui.layout.FixFlex({
     vertical:    true,
-    fixContent:  [oJobToolbar, oRunCondPlaceholder, oTreeDesignToolbar],
+    fixContent:  [oJobToolbar, oRcToolbar, oTreeDesignToolbar],
     flexContent: oTable
   });
 
@@ -762,6 +1682,32 @@ sap.ui.getCore().attachInit(function () {
   });
 
   new sap.m.App({ pages: [oPage] }).placeAt("content");
+
+  // ── Global keyboard + background-click handlers ───────────────────────────
+  // Capture phase fires before SAPUI5 processes the click, so __vtOnItemClick
+  // can read _ctrlKeyHeld reliably.
+  document.addEventListener('click', function (e) { _ctrlKeyHeld = e.ctrlKey; }, true);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && oRcState.waitPhase) { e.preventDefault(); commitRcWait(); return; }
+    if (e.key === 'Escape') {
+      if (oRcState.waitPhase) { cancelRcWait(); }
+      else { clearRowHighlight(); }
+    }
+  });
+
+  document.addEventListener('click', function (e) {
+    // Row click already handled by __vtOnItemClick — skip this tick
+    if (_rowClickHandled) { _rowClickHandled = false; return; }
+    if (!oRcState.activeItemIds.length && !oRcState.waitPhase) return;
+    // Only clear when clicking INSIDE the table body (not toolbars, RC panels, or any overlay
+    // popup — SAPUI5 Select/Popover overlays are appended to <body>, outside the table DOM)
+    var tableDom = oTable.getDomRef ? oTable.getDomRef() : null;
+    if (!tableDom || !tableDom.contains(e.target)) return;
+    // Don't clear when clicking on an actual data row
+    if (e.target.closest('tr.sapUiTableRow')) return;
+    clearRowHighlight();
+  });
 
   // Initial ruler render, then load data
   updateRuler();
