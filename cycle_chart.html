@@ -37,19 +37,42 @@
     .vtRcToolbar > .sapMFlexBox,
     .vtRcToolbar .sapMTBSpacer { background-color: #fff !important; }
     .vtRcToolbar { padding: 6px 8px; border-bottom: 1px solid #d9d9d9; }
-    .vtRcPanel { margin: 4px 8px 4px 0; width: 210px; border: 1px solid #d9d9d9 !important; border-radius: 4px; }
-    .vtRcPanel .sapMPanelContent { padding: 6px 8px !important; }
-    .vtRcPanel .sapMVBox > * { margin-bottom: 4px; }
+    .vtRcPanel { margin: 0px 3px 0px 0; width: 210px; border: 1px solid #d9d9d9 !important; border-radius: 4px; }
+    /* Strip all internal spacing from the phase boxes */
+    .vtRcPanel .sapMPanelWrappingDivTb { padding: 0 !important; }
+    .vtRcPanel .sapMPanelContent { padding: 2px !important; margin: 0 !important; }
+    .vtRcPanel .sapMVBox > * { margin: 0 !important; }
     .vtRcPanel .sapMHBox { align-items: center; }
     /* Panel header toolbar (CheckBox title row) */
-    .vtRcPanel .sapMPanelHdrToolbar { min-height: 32px; background-color: rgba(0,0,0,0.06) !important; border-bottom: 1px solid rgba(0,0,0,0.10) !important; }
+    .vtRcPanel .sapMPanelHdrToolbar { min-height: 26px !important; padding: 0 6px !important; background-color: rgba(0,0,0,0.06) !important; border-bottom: 1px solid rgba(0,0,0,0.10) !important; }
     .vtRcPanel .sapMPanelHdrToolbar .sapMCb { margin: 0; font-weight: 600; }
+    /* Add/Remove panel — auto-width, 2×2 grid of colored buttons */
+    .vtRcAddRemovePanel { width: auto !important; }
+    .vtRcAddRemovePanel .sapMPanelContent { padding: 4px !important; }
+    .vtRcAddRemovePanel .sapMHBox { gap: 2px; margin-bottom: 2px; }
+    /* Copy/Paste panel — 3 vertical sections side by side */
+    .vtCopyPastePanel .sapMPanelContent { padding: 0 !important; }
+    .vtCopyPastePanel .sapMHBox { margin-bottom: 0 !important; gap: 0 !important; }
+    .vtCPSection { padding: 4px 6px; display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; gap: 2px; }
+    .vtCPSection + .vtCPSection { border-left: 1px solid #e0e0e0; }
+    /* Add/Delete Process wrapper — panel grows to fill the height set by the outer stretch */
+    .vtRcAddRemoveBox { display: flex !important; flex-direction: column !important; align-items: center !important; }
+    .vtRcAddRemoveBox > .sapMPanel { flex: 1 !important; }
+    /* RC phases container — no padding/margin, panels sit directly inside */
+    .vtRcPhasesContainer { margin: 0 !important; padding: 0 !important; }
+    .vtRcPhasesContainer.sapMHBox { gap: 0 !important; }
+    /* Labels under each box */
+    .vtRcPhaseLabel, .vtAddRemoveLabel { display: block; width: 100%; text-align: center; font-size: 0.72rem; color: #8a8a8a; margin-top: 3px; }
 
     /* Remove horizontal row separator lines */
     .sapUiTableRow,
     .sapUiTableRowAlternate { border-bottom: none !important; border-top: none !important; }
     .sapUiTableCell,
     .sapUiTableCellInner    { border-bottom: none !important; border-top: none !important; }
+
+    /* Dialog form row spacing */
+    .vtDialogForm > .sapMHBox { margin-bottom: 8px; }
+    .vtDialogForm > .sapMHBox > .sapMLabel { padding-top: 7px; flex-shrink: 0; }
 
   </style>
 </head>
@@ -65,7 +88,16 @@ sap.ui.getCore().attachInit(function () {
 
   var scaleFactor = 2.0;   // pixels per second
   var maxCycleEnd = 500;   // updated after each API call
-  var bAutoExpand = false;
+  var nAutoExpandLevel = 0;
+
+  // In-memory metadata — no server calls until the Save button is pressed
+  var _jobState = {
+    job_number: "", job_title: "", job_description: "",
+    target_cycle_time: 60,
+    machine_list: [], robot_list: [], operator_list: []
+  };
+  var _opMetaMap  = {};  // opNumber → { op_title, op_description, num_of_parts }
+  var _opTreeCache = {}; // opNumber → deep copy of tree items
 
   var clipboard = { items: [], mode: 'copy' };
 
@@ -348,6 +380,28 @@ sap.ui.getCore().attachInit(function () {
     calculateItemValues(item, flatMap);                          // SECOND PASS
   }
 
+  // ── Confirm Copied Items ──────────────────────────────────────────────────
+  function confirmCopiedItems() {
+    if (!oRcState.activeItemIds.length) { sap.m.MessageToast.show("Select items first"); return; }
+    if (!window.confirm("Do you want to confirm the copied processes?")) return;
+    var items   = oDataModel.getProperty("/items");
+    var flatMap = buildFlatMap(items, {});
+    var changed = 0;
+    oRcState.activeItemIds.forEach(function (id) {
+      var item = flatMap[id];
+      if (item && item.title && item.title.indexOf('(**copy)') >= 0) {
+        item.title = item.title.replace(/\(\*\*copy\) ?/g, '').trim();
+        changed++;
+      }
+    });
+    if (changed > 0) {
+      recalcTree();
+      sap.m.MessageToast.show("Confirmed " + changed + " item(s)");
+    } else {
+      sap.m.MessageToast.show("No copied items in selection");
+    }
+  }
+
   // ── Main recalc entry point (mirrors cal_and_update_run_config_values_in_db)
   function recalcTree() {
     var items = oDataModel.getProperty("/items");
@@ -422,21 +476,24 @@ sap.ui.getCore().attachInit(function () {
 
   // Deep-clone one item and all its sub_process_items, assigning fresh UUIDs.
   // idMap is populated with { oldId: newId } for every node cloned.
-  function deepCloneWithNewIds(item, idMap) {
+  // addCopyPrefix: when true, prepends '(**copy) ' to every title in the subtree.
+  function deepCloneWithNewIds(item, idMap, addCopyPrefix) {
     var newId = crypto.randomUUID();
     idMap[item.item_id] = newId;
     var clonedChildren = (item.sub_process_items || []).map(function (child) {
-      var c = deepCloneWithNewIds(child, idMap);
+      var c = deepCloneWithNewIds(child, idMap, addCopyPrefix);
       c.parent_id = newId;
       return c;
     });
+    var title = item.title || "";
+    if (addCopyPrefix && title.indexOf('(**copy)') < 0) title = '(**copy) ' + title;
     return {
       id:               "",
       item_id:          newId,
       tree_index:       item.tree_index,
       step:             item.step,
       op_number:        item.op_number,
-      title:            item.title,
+      title:            title,
       parent_id:        item.parent_id,
       subprocess:       clonedChildren.map(function (c) { return c.item_id; }).join(','),
       run_cond_config:  item.run_cond_config,
@@ -484,6 +541,7 @@ sap.ui.getCore().attachInit(function () {
   var oSettingsModel   = new sap.ui.model.json.JSONModel({ scaleFactor: scaleFactor });
   var oDataModel       = new sap.ui.model.json.JSONModel({ items: [], maxCycleEnd: 0 });
   var oSelectedItemId  = null;   // item_id of the last clicked row
+  var oLastAddedItemId = null;   // item_id created by the most recent add — cleared on any manual click
 
   // RC interaction state
   var oRcState = {
@@ -577,6 +635,7 @@ sap.ui.getCore().attachInit(function () {
   // ── Item click handler ────────────────────────────────────────────────────
   window.__vtOnItemClick = function (sId) {
     _rowClickHandled = true;
+    oLastAddedItemId = null;   // user made a deliberate selection — disable sibling-bubbling
     var oCtrl = sap.ui.getCore().byId(sId);
     if (!oCtrl) return;
     var oCtx = oCtrl.getBindingContext();
@@ -938,7 +997,6 @@ sap.ui.getCore().attachInit(function () {
     oSelectedItemId = null;
     oRcState.activeItemIds = [];
     recalcTree();
-    saveToDb();
     sap.m.MessageToast.show("Cut " + clones.length + " item(s)");
   }
 
@@ -947,14 +1005,28 @@ sap.ui.getCore().attachInit(function () {
     if (!clipboard.items.length) { sap.m.MessageToast.show("Nothing to paste"); return; }
     var items   = oDataModel.getProperty("/items");
     var refItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
-    if (!refItem) { sap.m.MessageToast.show("Select a row first"); return; }
+    if (!refItem && mode !== 'subprocess') { sap.m.MessageToast.show("Select a row first"); return; }
 
-    // Fresh clone each time so multi-paste gives independent items
+    // Fresh clone each time so multi-paste gives independent items.
+    // deepCloneWithNewIds recurses the full subtree, so the copy prefix is
+    // stamped on every node at clone time — no separate walk needed.
     var newIdMap = {};
-    var freshClones = clipboard.items.map(function (item) { return deepCloneWithNewIds(item, newIdMap); });
+    var isCopyPaste = clipboard.mode === 'copy';
+    var freshClones = clipboard.items.map(function (item) { return deepCloneWithNewIds(item, newIdMap, isCopyPaste); });
     freshClones.forEach(function (c) { remapRcRefs(c, newIdMap); });
 
-    if (mode === 'subprocess') {
+    if (mode === 'subprocess' && !refItem) {
+      // No row selected — paste as new top-level stations
+      var op = oOpSelect.getSelectedKey();
+      freshClones.forEach(function (clone) {
+        clone.parent_id = "";
+        clone.op_number = op;
+        items.push(clone);
+      });
+      freshClones.forEach(function (clone) {
+        organizeRcAfterChange(items, buildFlatMap(items, {}), clone, false, false);
+      });
+    } else if (mode === 'subprocess') {
       if (!Array.isArray(refItem.sub_process_items)) refItem.sub_process_items = [];
       freshClones.forEach(function (clone) {
         clone.parent_id = refItem.item_id;
@@ -986,8 +1058,8 @@ sap.ui.getCore().attachInit(function () {
 
     oSelectedItemId        = freshClones[freshClones.length - 1].item_id;
     oRcState.activeItemIds = freshClones.map(function (c) { return c.item_id; });
+    nAutoExpandLevel = 5;
     recalcTree();
-    saveToDb();
     sap.m.MessageToast.show("Pasted " + freshClones.length + " item(s)");
   }
 
@@ -1014,46 +1086,21 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
 
-    var toDelete = collectAllItems(selItem);
-    var op       = oOpSelect.getSelectedKey();
-    var payload  = { op_number: op, data: toDelete };
+    // Capture siblings context BEFORE deletion so we know who comes next
+    var flatMap0    = buildFlatMap(items, {});
+    var ctx0        = getSiblingsContext(items, selItem, flatMap0);
+    var prevSibling = ctx0.idx > 0 ? ctx0.siblings[ctx0.idx - 1] : null;
 
-    fetch(API_BASE + "/removeProcess", {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(payload)
-    })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
-      .then(function () {
-        // Capture siblings context BEFORE deletion so we know who comes next
-        var flatMap0     = buildFlatMap(items, {});
-        var removedItem  = findItemById(items, oSelectedItemId);
-        var prevSibling  = null;
-        if (removedItem) {
-          var ctx0    = getSiblingsContext(items, removedItem, flatMap0);
-          prevSibling = ctx0.idx > 0 ? ctx0.siblings[ctx0.idx - 1] : null;
-        }
+    removeItemFromTree(items, oSelectedItemId);
+    oSelectedItemId = null;
 
-        removeItemFromTree(items, oSelectedItemId);
-        oSelectedItemId = null;
+    // Patch the RC of whatever item is now after prevSibling.
+    if (prevSibling) {
+      organizeRcAfterChange(items, buildFlatMap(items, {}), prevSibling, true, false);
+    }
 
-        // Patch the RC of whatever item is now after prevSibling (mirrors remove_item):
-        // if prevSibling exists → update its new next sibling's Start to After prevSibling;
-        // if no prevSibling     → handleSpecialCases will set the new first child to From Zero.
-        if (prevSibling) {
-          organizeRcAfterChange(items, buildFlatMap(items, {}), prevSibling, true, false);
-        }
-
-        recalcTree();
-        sap.m.MessageToast.show("Process removed");
-      })
-      .catch(function (err) {
-        console.error("[ValiantTMS] /removeProcess error:", err);
-        sap.m.MessageToast.show("Remove failed: " + err.message);
-      });
+    recalcTree();
+    sap.m.MessageToast.show("Process removed");
   }
 
   // ── Add Process ───────────────────────────────────────────────────────────
@@ -1061,8 +1108,41 @@ sap.ui.getCore().attachInit(function () {
     var items    = oDataModel.getProperty("/items");
     var currItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
 
+    // If the selected item was itself just added by the previous click (not a
+    // deliberate user selection), bubble up so repeated "Add As Subprocess"
+    // clicks keep adding siblings rather than nesting ever deeper.
+    if (currItem && currItem.parent_id && currItem.item_id === oLastAddedItemId) {
+      currItem = findItemById(items, currItem.parent_id) || currItem;
+    }
+
     if (!currItem) {
-      sap.m.MessageToast.show("Click a row first to select a parent");
+      var op = oOpSelect.getSelectedKey();
+      var newStation = {
+        id:               "",
+        item_id:          crypto.randomUUID(),
+        tree_index:       items.length,
+        step:             "",
+        op_number:        op,
+        title:            "------ New_Station ------",
+        parent_id:        "",
+        subprocess:       "",
+        run_cond_config:  JSON.stringify({ Cycle: { "Custom value": [10] } }),
+        dependant_items:  JSON.stringify({ Start: [], Cycle: [], End: [] }),
+        cycle_start:      0,
+        cycle_time:       0,
+        cycle_end:        0,
+        color:            "#09528A",
+        cycle_type:       "Station",
+        highlight:        "",
+        sub_process_items: []
+      };
+      items.push(newStation);
+      oSelectedItemId        = newStation.item_id;
+      oRcState.activeItemIds = [newStation.item_id];
+      organizeRcAfterChange(items, buildFlatMap(items, {}), newStation, false, false);
+      recalcTree();
+      oLastAddedItemId = newStation.item_id;
+      focusAndEditNewItem(newStation.item_id);
       return;
     }
 
@@ -1100,23 +1180,8 @@ sap.ui.getCore().attachInit(function () {
     // Set Start RC (After prev sibling / From Zero) and patch next sibling if any
     organizeRcAfterChange(items, buildFlatMap(items, {}), newItem, false, false);
     recalcTree();
-
-    fetch(API_BASE + "/addAsSubProcess", {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ item_id: currItem.item_id, new_item: newItem })
-    })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
-      .then(function () {
-        sap.m.MessageToast.show("Process added — double-click to rename, then Save");
-      })
-      .catch(function (err) {
-        console.error("[ValiantTMS] /addAsSubProcess error:", err);
-        sap.m.MessageToast.show("Add failed: " + err.message);
-      });
+    oLastAddedItemId = newItem.item_id;
+    focusAndEditNewItem(newItem.item_id);
   }
 
   // ── Add Above / Add Below ─────────────────────────────────────────────────
@@ -1159,19 +1224,46 @@ sap.ui.getCore().attachInit(function () {
 
     organizeRcAfterChange(items, buildFlatMap(items, {}), newItem, false, false);
     recalcTree();
+    oLastAddedItemId = newItem.item_id;
+    focusAndEditNewItem(newItem.item_id);
+  }
 
-    var endpoint = offset === 0 ? '/addAbove' : '/addBelow';
-    fetch(API_BASE + endpoint, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ ref_item_id: refItemId, new_item: newItem })
-    })
-      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-      .then(function () { sap.m.MessageToast.show("Process added — double-click to rename, then Save"); })
-      .catch(function (err) {
-        console.error("[ValiantTMS] " + endpoint + " error:", err);
-        sap.m.MessageToast.show("Add failed: " + err.message);
-      });
+  // ── Auto-focus inline edit after add ────────────────────────────────────
+  // After recalcTree() the TreeTable re-renders asynchronously.  We wait one
+  // frame, scan rows for the target item_id, and fire the same dblclick logic.
+  function focusAndEditNewItem(itemId) {
+    // Sync selection state and RC panel to the new item so applyRcChange targets it.
+    var items0 = oDataModel.getProperty("/items");
+    var newItem0 = findItemById(items0, itemId);
+    if (newItem0) {
+      oSelectedItemId        = itemId;
+      oRcState.activeItemIds = [itemId];
+      var rc0 = parseRC(newItem0.run_cond_config);
+      oActivePhases = [];
+      if (rc0.start && rc0.start.condition) oActivePhases.push('start');
+      if (rc0.cycle && rc0.cycle.condition) oActivePhases.push('cycle');
+      if (rc0.end   && rc0.end.condition)   oActivePhases.push('end');
+      if (!oActivePhases.length) oActivePhases = ['start', 'cycle'];
+      refreshRcToolbar(newItem0);
+    }
+
+    setTimeout(function () {
+      var rows = oTable.getRows();
+      for (var i = 0; i < rows.length; i++) {
+        var ctx = rows[i].getBindingContext();
+        if (!ctx) continue;
+        var obj = ctx.getObject();
+        if (obj && obj.item_id === itemId) {
+          var cell = rows[i].getCells()[0];
+          if (cell) {
+            window.__vtOnItemDblClick(cell.getId(), function () {
+              oRcCycleValueInput.focus(); // focus handler clears error state, autocomplete, and selects all
+            });
+          }
+          break;
+        }
+      }
+    }, 150);
   }
 
   // ── Inline title rename helpers ──────────────────────────────────────────
@@ -1200,10 +1292,34 @@ sap.ui.getCore().attachInit(function () {
     });
   }
 
+  function _buildJobMetadata(op, items) {
+    var meta         = _opMetaMap[op] || {};
+    var stationList  = (items || []).map(function (item) { return item.item_id; }).join(",");
+    var usedCycleTime = getMaxCycleEnd(items);
+    return {
+      op_number:                  op,
+      op_title:                   meta.op_title       || null,
+      job_description:            meta.op_description || null,
+      job_pictures:               null,
+      station_list:               stationList,
+      machine_cycle_time_summary: "{}",
+      total_machine_cycle:        0.0,
+      total_manual_cycle:         0.0,
+      total_robot_cycle:          0.0,
+      total_operator_cycle:       0.0,
+      used_cycle_time:            usedCycleTime,
+      num_of_parts:               meta.num_of_parts   || 1
+    };
+  }
+
   function saveToDb() {
     var items   = oDataModel.getProperty("/items");
     var op      = oOpSelect.getSelectedKey();
-    var payload = { updated_db: stripClientFields(items), op_number: op };
+    var payload = {
+      cycle_general_structure: stripClientFields(items),
+      job_metadata:            _buildJobMetadata(op, items),
+      op_number:               op
+    };
     console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length);
 
     fetch(API_BASE + "/updateDB", {
@@ -1217,7 +1333,7 @@ sap.ui.getCore().attachInit(function () {
     sap.m.MessageToast.show("Saved");
   }
 
-  window.__vtOnItemDblClick = function (sId) {
+  window.__vtOnItemDblClick = function (sId, onAfterCommit) {
     var oCtrl = sap.ui.getCore().byId(sId);
     if (!oCtrl) return;
     var oCtx = oCtrl.getBindingContext();
@@ -1266,6 +1382,7 @@ sap.ui.getCore().attachInit(function () {
       } else {
         oCtrl.invalidate();
       }
+      if (typeof onAfterCommit === "function") setTimeout(onAfterCommit, 80);
     }
 
     function cancel() {
@@ -1377,31 +1494,62 @@ sap.ui.getCore().attachInit(function () {
   });
 
   // ── Custom TitleCell control ──────────────────────────────────────────────
-  //   Shows title with visual weight based on cycle_type.
+  //   Color and font driven by step depth, mirroring themeParameters logic.
   sap.ui.core.Control.extend("TitleCell", {
     metadata: {
       properties: {
         title:     { type: "string", defaultValue: "" },
+        rawTitle:  { type: "string", defaultValue: "" },
+        step:      { type: "string", defaultValue: "" },
         cycleType: { type: "string", defaultValue: "Undefined" },
         color:     { type: "string", defaultValue: "#32363a" }
       }
     },
     renderer: function (oRm, oCtrl) {
-      var ct    = oCtrl.getCycleType() || "Undefined";
-      // Station always brown; Process group and leaf steps use the DB color field
-      var title = oCtrl.getTitle() || "";
-      var isNew = title.indexOf("New_Process") >= 0;
-      var color = isNew ? "#66bb6a" : (ct === "Station" ? "brown" : (oCtrl.getColor() || "#32363a"));
-      var fw    = ct === "Station" ? "700" : ct === "Process group" ? "600" : "400";
-      var pl    = ct === "Station" ? "0"   : "4px";
+      var title    = oCtrl.getTitle()    || "";
+      var rawTitle = oCtrl.getRawTitle() || "";
+      var step     = oCtrl.getStep()     || "";
+      var isNew    = rawTitle.indexOf("New_Process") >= 0 || rawTitle.indexOf("New_Station") >= 0;
+      var isCopy   = rawTitle.indexOf("(**copy)") >= 0;
+      var level  = step ? step.split("_").length : 0;
+
+      // ── Color ───────────────────────────────────────────────────────────
+      var color;
+      if (isCopy) {
+        color = "red";
+      } else if (isNew) {
+        color = "#66bb6a";
+      } else {
+        switch (level) {
+          case 1:  color = "brown";   break;  // Station
+          case 2:  color = "#193CB8"; break;
+          case 3:  color = "#1447E6"; break;
+          case 4:  color = "#098A81"; break;
+          case 5:  color = "#8A0912"; break;
+          case 6:  color = "#8A8109"; break;
+          case 7:  color = "#4A5565"; break;
+          default: color = "#9F9FA9"; break;
+        }
+      }
+
+      // ── Font ────────────────────────────────────────────────────────────
+      var fw, fi, tt, pl;
+      if (level <= 1) {
+        fw = "700"; fi = "normal"; tt = "uppercase"; pl = "0";
+      } else if (level === 2) {
+        fw = "700"; fi = "normal"; tt = "none";      pl = "4px";
+      } else {
+        fw = "400"; fi = "italic"; tt = "none";      pl = "4px";
+      }
+
       oRm.write('<span');
       oRm.writeControlData(oCtrl);
       oRm.writeAttribute("onclick", "window.__vtOnItemClick('" + oCtrl.getId() + "')");
       oRm.writeAttribute("ondblclick", "event.stopPropagation();window.__vtOnItemDblClick('" + oCtrl.getId() + "')");
       oRm.write(' style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' +
                 'display:block;line-height:36px;font-size:13px;cursor:pointer;' +
-                'color:' + color + ';font-weight:' + fw + ';padding-left:' + pl + ';' +
-                (isNew ? 'font-style:italic;' : '') + '"' +
+                'color:' + color + ';font-weight:' + fw + ';font-style:' + fi + ';' +
+                'text-transform:' + tt + ';padding-left:' + pl + ';"' +
                 ' title="' + title + '">');
       oRm.writeEscaped(title);
       oRm.write('</span>');
@@ -1481,6 +1629,8 @@ sap.ui.getCore().attachInit(function () {
                          return (step ? step + " > " : "") + (title || "");
                        }
                      },
+                     rawTitle:  "{title}",
+                     step:      "{step}",
                      cycleType: "{cycle_type}",
                      color:     "{color}"
                    }),
@@ -1530,9 +1680,10 @@ sap.ui.getCore().attachInit(function () {
 
   // Auto-expand to level 2 after each data load; re-apply row highlight after virtual re-render
   oTable.attachRowsUpdated(function () {
-    if (bAutoExpand) {
-      bAutoExpand = false;
-      oTable.expandToLevel(2);
+    if (nAutoExpandLevel > 0) {
+      var lvl = nAutoExpandLevel;
+      nAutoExpandLevel = 0;
+      oTable.expandToLevel(lvl);
     }
     if (oRcState.activeItemIds.length) { applyRowHighlight(); }
     if (oRcWaitSelectedIds.length) { applyWaitHighlights(); }
@@ -1549,7 +1700,7 @@ sap.ui.getCore().attachInit(function () {
 
   // ── API calls ─────────────────────────────────────────────────────────────
   function loadTree(opNumber) {
-    bAutoExpand = true;
+    nAutoExpandLevel = 2;
     fetch(API_BASE + "/updateTree", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
@@ -1564,6 +1715,7 @@ sap.ui.getCore().attachInit(function () {
         annotateSteps(items, null);
         annotateAncestors(items, []);
         maxCycleEnd = getMaxCycleEnd(items) || 500;
+        _opTreeCache[opNumber] = JSON.parse(JSON.stringify(items));
         oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
         updateGanttColumn();
         updateRuler();
@@ -1571,6 +1723,24 @@ sap.ui.getCore().attachInit(function () {
       .catch(function (err) {
         sap.m.MessageToast.show("Error loading op data: " + err.message);
       });
+  }
+
+  function _loadTreeFromCache(opNumber) {
+    var items = JSON.parse(JSON.stringify(_opTreeCache[opNumber] || []));
+    nAutoExpandLevel = 2;
+    annotateSteps(items, null);
+    annotateAncestors(items, []);
+    maxCycleEnd = getMaxCycleEnd(items) || 500;
+    oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
+    updateGanttColumn();
+    updateRuler();
+  }
+
+  function _cacheCurrentOp() {
+    var op = oOpSelect.getSelectedKey();
+    if (op) {
+      _opTreeCache[op] = JSON.parse(JSON.stringify(oDataModel.getProperty("/items") || []));
+    }
   }
 
   function loadOpNumbers() {
@@ -1617,7 +1787,8 @@ sap.ui.getCore().attachInit(function () {
   // ── Op number select ──────────────────────────────────────────────────────
   var oOpSelect = new sap.m.Select({
     change: function (oEvent) {
-      loadTree(oEvent.getParameter("selectedItem").getKey());
+      var op = oEvent.getParameter("selectedItem").getKey();
+      if (_opTreeCache[op]) { _loadTreeFromCache(op); } else { loadTree(op); }
     }
   });
 
@@ -1632,6 +1803,380 @@ sap.ui.getCore().attachInit(function () {
     });
   }
 
+  // ── Job / Op Dialogs ─────────────────────────────────────────────────────
+
+  // Helper: resource list panel (machine / robot / operator)
+  function makeResourceListPanel(headerText) {
+    var oList  = new sap.m.List({ mode: "SingleSelectMaster", showNoData: false });
+    var oInput = new sap.m.Input({ placeholder: "Enter name…", width: "220px" });
+    function _addItem() {
+      var v = oInput.getValue().trim();
+      if (!v) return;
+      oList.addItem(new sap.m.StandardListItem({ title: v }));
+      oInput.setValue(""); oInput.focus();
+    }
+    oInput.attachSubmit(_addItem);
+    return {
+      panel: new sap.m.Panel({
+        headerText: headerText, expandable: false,
+        content: [
+          new sap.m.Toolbar({ style: "Clear", content: [
+            oInput,
+            new sap.m.Button({ icon: "sap-icon://add",     type: "Transparent", press: _addItem }),
+            new sap.m.Button({ icon: "sap-icon://decline", type: "Transparent",
+              press: function () { var s = oList.getSelectedItem(); if (s) oList.removeItem(s); }
+            })
+          ]}),
+          oList
+        ]
+      }),
+      getItems: function () { return oList.getItems().map(function (i) { return i.getTitle(); }); },
+      setItems: function (arr) {
+        oList.removeAllItems();
+        (arr || []).forEach(function (v) { oList.addItem(new sap.m.StandardListItem({ title: String(v) })); });
+      }
+    };
+  }
+
+  // ── Op Dialog ───────────────────────────────────────────────────────────────
+  var oOpNumInput   = new sap.m.Input({ placeholder: "e.g. Op200", width: "180px" });
+  var oOpTitleInput = new sap.m.Input({ placeholder: "Op title",   width: "100%" });
+  var oOpDescInput  = new sap.m.TextArea({ placeholder: "Op description", width: "100%", rows: 3 });
+  var oOpPartsInput = new sap.m.StepInput({ min: 1, max: 999, value: 1, width: "120px" });
+  var _opDialogMode = "add";
+
+  function openOpDialog(mode, opNumber) {
+    _opDialogMode = mode;
+    oOpNumInput.setValueState("None");
+    if (mode === "add") {
+      oOpDialog.setTitle("New Operation");
+      oOpNumInput.setValue("").setEditable(true);
+      oOpTitleInput.setValue(""); oOpDescInput.setValue(""); oOpPartsInput.setValue(1);
+    } else {
+      var meta = _opMetaMap[opNumber] || {};
+      oOpDialog.setTitle("Edit Op: " + opNumber);
+      oOpNumInput.setValue(opNumber).setEditable(false);
+      oOpTitleInput.setValue(meta.op_title || "");
+      oOpDescInput.setValue(meta.op_description || "");
+      oOpPartsInput.setValue(meta.num_of_parts || 1);
+    }
+    oOpDialog.open();
+  }
+
+  function _saveOpDialog() {
+    var opNum = oOpNumInput.getValue().trim();
+    if (!opNum) { oOpNumInput.setValueState("Error").setValueStateText("Op # is required"); return; }
+    // Check for duplicate op # when adding
+    if (_opDialogMode === "add") {
+      var existing = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+      if (existing.indexOf(opNum) >= 0) {
+        oOpNumInput.setValueState("Error").setValueStateText("Op '" + opNum + "' already exists");
+        return;
+      }
+    }
+    oOpNumInput.setValueState("None");
+    _opMetaMap[opNum] = {
+      op_title:       oOpTitleInput.getValue().trim(),
+      op_description: oOpDescInput.getValue().trim(),
+      num_of_parts:   oOpPartsInput.getValue()
+    };
+    if (_opDialogMode === "add") {
+      _opTreeCache[opNum] = [];
+      oOpSelect.addItem(new sap.ui.core.Item({ key: opNum, text: opNum }));
+      _cacheCurrentOp();
+      oOpSelect.setSelectedKey(opNum);
+      _loadTreeFromCache(opNum);
+      var newOpPayload = {
+        cycle_general_structure: [],
+        job_metadata:            _buildJobMetadata(opNum, []),
+        op_number:               opNum
+      };
+      fetch(API_BASE + "/updateDB", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(newOpPayload)
+      })
+        .then(function (r) { console.log("[ValiantTMS] /updateDB createOp:", r.status); })
+        .catch(function (err) { console.warn("[ValiantTMS] /updateDB createOp error:", err.message); });
+    }
+    oOpDialog.close();
+    sap.m.MessageToast.show(_opDialogMode === "add" ? "Op '" + opNum + "' created." : "Op saved.");
+  }
+
+  var oOpDialog = new sap.m.Dialog({
+    title: "Operation", contentWidth: "460px", draggable: true, resizable: true,
+    content: [new sap.m.VBox({ renderType: "Bare", items: [
+      new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
+        items: [new sap.m.Label({ text: "Op #:", required: true, width: "110px" }), oOpNumInput] }),
+      new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
+        items: [new sap.m.Label({ text: "Title:",               width: "110px" }), oOpTitleInput] }),
+      new sap.m.HBox({ alignItems: "Start",  renderType: "Bare",
+        items: [new sap.m.Label({ text: "Description:",         width: "110px" }), oOpDescInput] }),
+      new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
+        items: [new sap.m.Label({ text: "# of Parts:",          width: "110px" }), oOpPartsInput] })
+    ]}).addStyleClass("vtDialogForm")],
+    beginButton: new sap.m.Button({ text: "Save", type: "Emphasized", press: function () { _saveOpDialog(); } }),
+    endButton:   new sap.m.Button({ text: "Cancel", press: function () { oOpDialog.close(); } })
+  });
+
+  // ── Duplicate Op Dialog ──────────────────────────────────────────────────────
+  var oDupOpInput = new sap.m.Input({ placeholder: "New Op # (e.g. Op500)", width: "260px" });
+
+  function openDupOpDialog() {
+    var op = oOpSelect.getSelectedKey();
+    if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+    oDupOpInput.setValue("").setValueState("None");
+    oDupOpDialog.setTitle("Duplicate: " + op);
+    oDupOpDialog.open();
+  }
+
+  // Deep-copy tree items with fresh item IDs so the duplicate is independent
+  function _deepCopyItems(items) {
+    var idMap = {};
+    function collectIds(nodes) {
+      (nodes || []).forEach(function (n) {
+        var newId = "cp" + Math.random().toString(36).slice(2, 8);
+        idMap[n.item_id] = newId;
+        collectIds(n.sub_process_items);
+      });
+    }
+    function remap(nodes) {
+      return (nodes || []).map(function (n) {
+        var copy = JSON.parse(JSON.stringify(n));
+        copy.item_id  = idMap[n.item_id] || n.item_id;
+        copy.parent_id = idMap[n.parent_id] || n.parent_id || "";
+        if (copy.subprocess) {
+          copy.subprocess = copy.subprocess.split(",").map(function (s) {
+            return idMap[s.trim()] || s.trim();
+          }).join(",");
+        }
+        copy.sub_process_items = remap(n.sub_process_items);
+        return copy;
+      });
+    }
+    collectIds(items);
+    return remap(items);
+  }
+
+  var oDupOpDialog = new sap.m.Dialog({
+    title: "Duplicate Operation", contentWidth: "380px", draggable: true,
+    content: [new sap.m.VBox({ renderType: "Bare", items: [
+      new sap.m.Label({ text: "New Op #:", required: true }),
+      oDupOpInput
+    ]}),],
+    beginButton: new sap.m.Button({ text: "Duplicate", type: "Emphasized",
+      press: function () {
+        var newOp = oDupOpInput.getValue().trim();
+        if (!newOp) { oDupOpInput.setValueState("Error"); return; }
+        var existing = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+        if (existing.indexOf(newOp) >= 0) {
+          oDupOpInput.setValueState("Error").setValueStateText("Op '" + newOp + "' already exists");
+          return;
+        }
+        oDupOpInput.setValueState("None");
+        var srcOp = oOpSelect.getSelectedKey();
+        _cacheCurrentOp();
+        var srcItems = _opTreeCache[srcOp] || [];
+        _opTreeCache[newOp] = _deepCopyItems(srcItems);
+        var srcMeta = _opMetaMap[srcOp] || {};
+        _opMetaMap[newOp] = JSON.parse(JSON.stringify(srcMeta));
+        oOpSelect.addItem(new sap.ui.core.Item({ key: newOp, text: newOp }));
+        oOpSelect.setSelectedKey(newOp);
+        _loadTreeFromCache(newOp);
+        oDupOpDialog.close();
+        sap.m.MessageToast.show("Op '" + newOp + "' duplicated.");
+      }
+    }),
+    endButton: new sap.m.Button({ text: "Cancel", press: function () { oDupOpDialog.close(); } })
+  });
+
+  // ── Target Cycle Time controls ────────────────────────────────────────────────
+  var _tctDirectMode  = true;
+  var oTctDirectInput = new sap.m.StepInput({ min: 1, max: 9999, value: 60, step: 1, width: "140px", description: "s" });
+  var oTctDaysInput   = new sap.m.StepInput({ min: 1, max: 365,   value: 250, step: 1,   width: "115px" });
+  var oTctHrsInput    = new sap.m.StepInput({ min: 1, max: 24,    value: 8,   step: 0.5, width: "115px" });
+  var oTctDpwInput    = new sap.m.StepInput({ min: 1, max: 7,     value: 5,   step: 1,   width: "115px" });
+  var oTctJobsInput   = new sap.m.StepInput({ min: 1, max: 99999, value: 100, step: 1,   width: "115px" });
+  var oTctWeeksLbl    = new sap.m.Text({ text: "—" });
+  var oTctProdHrLbl   = new sap.m.Text({ text: "—" });
+  var oTctTotalLbl    = new sap.m.Text({ text: "—" });
+
+  // _planRows: each row has label, default value, and calculated result fields
+  var _planRows = [
+    { label: "Efficiency (%)",       value: 85, parts: 0, pph: 0, spp: 0 },
+    { label: "Extra Conditions (%)", value: 5,  parts: 0, pph: 0, spp: 0 },
+    { label: "Utilization (%)",      value: 80, parts: 0, pph: 0, spp: 0 }
+  ];
+  var _planValInputs = [], _planPartsLbls = [], _planPphLbls = [], _planSppLbls = [];
+
+  function _recalcPlan() {
+    var days    = parseFloat(oTctDaysInput.getValue())  || 0;
+    var hrs     = parseFloat(oTctHrsInput.getValue())   || 0;
+    var dpw     = parseFloat(oTctDpwInput.getValue())   || 1;
+    var jobs    = parseFloat(oTctJobsInput.getValue())  || 0;
+    var prodHrs = days * hrs;
+    var total   = jobs * days;
+    oTctWeeksLbl.setText(String(dpw > 0 ? Math.round(days / dpw) : 0));
+    oTctProdHrLbl.setText(String(prodHrs));
+    oTctTotalLbl.setText(String(total));
+    _planRows.forEach(function (row, i) {
+      var pct  = parseFloat(_planValInputs[i].getValue()) || 0;
+      var frac = pct / 100;
+      var parts;
+      if (i === 0)      parts = frac > 0 ? Math.round(total              / frac * 100) / 100 : 0;
+      else if (i === 1) parts = Math.round(_planRows[0].parts * (1 + frac) * 100) / 100;
+      else              parts = frac > 0 ? Math.round(_planRows[1].parts  / frac * 100) / 100 : 0;
+      row.parts = parts;
+      var pph = prodHrs > 0 ? Math.round(parts / prodHrs * 100) / 100 : 0;
+      var spp = pph > 0 ? Math.round(3600 / pph * 100) / 100 : 0;
+      row.pph = pph; row.spp = spp;
+      _planPartsLbls[i].setText(String(parts));
+      _planPphLbls[i].setText(String(pph));
+      _planSppLbls[i].setText(String(spp));
+    });
+    if (!_tctDirectMode && _planRows[2].spp > 0) oTctDirectInput.setValue(_planRows[2].spp);
+  }
+  [oTctDaysInput, oTctHrsInput, oTctDpwInput, oTctJobsInput].forEach(function (inp) {
+    inp.attachChange(function () { _recalcPlan(); });
+  });
+
+  var _planTableItems = _planRows.map(function (row, i) {
+    var vi = new sap.m.Input({ value: String(row.value), width: "72px", textAlign: "Right",
+      change: function () { _recalcPlan(); } });
+    var pl = new sap.m.Text({ text: "—", wrapping: false });
+    var ph = new sap.m.Text({ text: "—", wrapping: false });
+    var sl = new sap.m.Text({ text: "—", wrapping: false });
+    _planValInputs.push(vi); _planPartsLbls.push(pl); _planPphLbls.push(ph); _planSppLbls.push(sl);
+    return new sap.m.ColumnListItem({ cells: [new sap.m.Text({ text: row.label }), vi, pl, ph, sl] });
+  });
+
+  var oPlanFactorTable = new sap.m.Table({
+    growing: false,
+    columns: [
+      new sap.m.Column({ header: new sap.m.Label({ text: "Factor" }),       width: "155px" }),
+      new sap.m.Column({ header: new sap.m.Label({ text: "Value" }),        width: "85px"  }),
+      new sap.m.Column({ header: new sap.m.Label({ text: "Req parts/yr" }) }),
+      new sap.m.Column({ header: new sap.m.Label({ text: "pph" }),          width: "72px"  }),
+      new sap.m.Column({ header: new sap.m.Label({ text: "sec/part" }),     width: "80px"  })
+    ],
+    items: _planTableItems
+  });
+
+  var oTctDirectPanel = new sap.m.Panel({
+    headerText: "Direct Input", expandable: false,
+    content: [new sap.m.HBox({ alignItems: "Center", items: [
+      new sap.m.Label({ text: "Target Cycle Time:", width: "155px" }), oTctDirectInput
+    ]})]
+  });
+
+  var oTctPlanPanel = new sap.m.Panel({
+    visible: false, headerText: "Operating Plan", expandable: false,
+    content: [
+      new sap.ui.layout.Grid({
+        defaultSpan: "L6 M6 S12",
+        content: [
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Days/year" }),      oTctDaysInput  ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Hours/day" }),      oTctHrsInput   ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Days/week" }),      oTctDpwInput   ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Jobs/day" }),       oTctJobsInput  ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Weeks/year" }),     oTctWeeksLbl   ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Prod hrs/yr" }),    oTctProdHrLbl  ] }),
+          new sap.m.VBox({ items: [new sap.m.Label({ text: "Parts/yr total" }), oTctTotalLbl   ] })
+        ]
+      }),
+      oPlanFactorTable
+    ]
+  });
+
+  var oTctModeBtn = new sap.m.SegmentedButton({
+    selectedKey: "direct",
+    items: [
+      new sap.m.SegmentedButtonItem({ key: "direct", text: "Direct Input"   }),
+      new sap.m.SegmentedButtonItem({ key: "plan",   text: "Operating Plan" })
+    ],
+    selectionChange: function (oEvent) {
+      _tctDirectMode = oEvent.getParameter("item").getKey() === "direct";
+      oTctDirectPanel.setVisible(_tctDirectMode);
+      oTctPlanPanel.setVisible(!_tctDirectMode);
+      if (!_tctDirectMode) { _recalcPlan(); }
+    }
+  });
+
+  // ── Job Dialog resource panels ─────────────────────────────────────────────
+  var _machinePanel  = makeResourceListPanel("Machine List");
+  var _robotPanel    = makeResourceListPanel("Robot List");
+  var _operatorPanel = makeResourceListPanel("Manual Operations");
+
+  // ── Job Dialog ─────────────────────────────────────────────────────────────
+  var oJobNumInput   = new sap.m.Input({ placeholder: "e.g. J100",   width: "200px" });
+  var oJobTitleInput = new sap.m.Input({ placeholder: "Job title",   width: "100%" });
+  var oJobDescInput  = new sap.m.TextArea({ placeholder: "Job description", width: "100%", rows: 4 });
+
+  function openJobDialog() {
+    oJobNumInput.setValue(_jobState.job_number).setValueState("None");
+    oJobTitleInput.setValue(_jobState.job_title);
+    oJobDescInput.setValue(_jobState.job_description);
+    oTctDirectInput.setValue(_jobState.target_cycle_time || 60);
+    _machinePanel.setItems(_jobState.machine_list  || []);
+    _robotPanel.setItems(_jobState.robot_list      || []);
+    _operatorPanel.setItems(_jobState.operator_list || []);
+    oJobDialog.open();
+  }
+
+  function _saveJobDialog() {
+    var jobNum = oJobNumInput.getValue().trim();
+    if (!jobNum) { oJobNumInput.setValueState("Error").setValueStateText("Job # is required"); return; }
+    oJobNumInput.setValueState("None");
+    var tct = _tctDirectMode
+      ? oTctDirectInput.getValue()
+      : (_planRows[2].spp > 0 ? _planRows[2].spp : oTctDirectInput.getValue());
+    _jobState.job_number        = jobNum;
+    _jobState.job_title         = oJobTitleInput.getValue().trim();
+    _jobState.job_description   = oJobDescInput.getValue().trim();
+    _jobState.target_cycle_time = tct;
+    _jobState.machine_list      = _machinePanel.getItems();
+    _jobState.robot_list        = _robotPanel.getItems();
+    _jobState.operator_list     = _operatorPanel.getItems();
+    oJobDialog.close();
+    sap.m.MessageToast.show("Job saved.");
+  }
+
+  var oJobDialog = new sap.m.Dialog({
+    title: "Job Specifications", contentWidth: "620px", resizable: true, draggable: true,
+    content: [new sap.m.IconTabBar({
+      stretchContentHeight: false,
+      items: [
+        new sap.m.IconTabFilter({
+          key: "spec", text: "Job Spec", icon: "sap-icon://factory",
+          content: [new sap.m.VBox({ renderType: "Bare", items: [
+            new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
+              items: [new sap.m.Label({ text: "Job #:", required: true, width: "120px" }), oJobNumInput] }),
+            new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
+              items: [new sap.m.Label({ text: "Title:",               width: "120px" }), oJobTitleInput] }),
+            new sap.m.HBox({ alignItems: "Start",  renderType: "Bare",
+              items: [new sap.m.Label({ text: "Description:",         width: "120px" }), oJobDescInput] })
+          ]}).addStyleClass("vtDialogForm")]
+        }),
+        new sap.m.IconTabFilter({
+          key: "tct", text: "Target Cycle Time", icon: "sap-icon://time-entry-request",
+          content: [new sap.m.VBox({ items: [
+            new sap.m.Toolbar({ style: "Clear", content: [oTctModeBtn] }),
+            oTctDirectPanel,
+            oTctPlanPanel
+          ]})]
+        }),
+        new sap.m.IconTabFilter({
+          key: "resources", text: "Resources", icon: "sap-icon://group",
+          content: [new sap.m.VBox({ items: [
+            _machinePanel.panel, _robotPanel.panel, _operatorPanel.panel
+          ]})]
+        })
+      ]
+    })],
+    beginButton: new sap.m.Button({ text: "Save", type: "Emphasized", press: function () { _saveJobDialog(); } }),
+    endButton:   new sap.m.Button({ text: "Cancel", press: function () { oJobDialog.close(); } })
+  });
+
   // ── Job Toolbar ───────────────────────────────────────────────────────────
   var oJobToolbar = new sap.m.Toolbar({
     style: "Standard",
@@ -1640,16 +2185,59 @@ sap.ui.getCore().attachInit(function () {
         icon:  "sap-icon://factory",
         text:  "Job",
         type:  "Transparent",
-        press: function () { /* TODO: open job dialog */ }
+        press: function () { openJobDialog(); }
       }),
       new sap.m.ToolbarSeparator(),
       new sap.m.Label({ text: "Operation:" }),
       new sap.m.ToolbarSpacer({ width: "6px" }),
       oOpSelect,
-      new sap.m.Button({ icon: "sap-icon://add-circle", type: "Transparent", tooltip: "Add Op" }),
-      new sap.m.Button({ icon: "sap-icon://edit",       type: "Transparent", tooltip: "Edit Op" }),
-      new sap.m.Button({ icon: "sap-icon://copy",       type: "Transparent", tooltip: "Duplicate Op" }),
-      new sap.m.Button({ icon: "sap-icon://delete",     type: "Transparent", tooltip: "Delete Op" }),
+      new sap.m.Button({ icon: "sap-icon://create", type: "Transparent", tooltip: "Add Op",
+        press: function () { openOpDialog("add", null); }
+      }),
+      new sap.m.Button({ icon: "sap-icon://edit", type: "Transparent", tooltip: "Edit Op",
+        press: function () {
+          var op = oOpSelect.getSelectedKey();
+          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+          openOpDialog("edit", op);
+        }
+      }),
+      new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate Op",
+        press: function () { openDupOpDialog(); }
+      }),
+      new sap.m.Button({ icon: "sap-icon://delete", type: "Transparent", tooltip: "Delete Op",
+        press: function () {
+          var op = oOpSelect.getSelectedKey();
+          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+          sap.m.MessageBox.confirm('Delete Op ' + op + ' and all its processes?', {
+            onClose: function (action) {
+              if (action !== 'OK') return;
+              var treeData = stripClientFields(_opTreeCache[op] || []);
+              delete _opTreeCache[op];
+              delete _opMetaMap[op];
+              var allItems = oOpSelect.getItems();
+              var idx = 0;
+              for (var k = 0; k < allItems.length; k++) { if (allItems[k].getKey() === op) { idx = k; break; } }
+              oOpSelect.removeItem(allItems[idx]);
+              var remaining = oOpSelect.getItems();
+              if (remaining.length > 0) {
+                var nextKey = remaining[Math.max(0, idx - 1)].getKey();
+                oOpSelect.setSelectedKey(nextKey);
+                if (_opTreeCache[nextKey]) { _loadTreeFromCache(nextKey); } else { loadTree(nextKey); }
+              } else {
+                oDataModel.setData({ items: [], maxCycleEnd: 500 });
+              }
+              fetch(API_BASE + '/removeProcess', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ op_number: op, data: treeData })
+              })
+                .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
+                .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
+              sap.m.MessageToast.show('Op ' + op + ' deleted.');
+            }
+          });
+        }
+      }),
       new sap.m.ToolbarSpacer(),
       new sap.m.ToggleButton({
         icon:    "sap-icon://detail-view",
@@ -1742,6 +2330,17 @@ sap.ui.getCore().attachInit(function () {
     width: '115px',
     change: function () { this.setValueState('None'); applyRcChange('cycle', RC_COND.CUSTOM_VALUE, [oRcCycleValueInput.getValue()], 0); }
   });
+  oRcCycleValueInput.addEventDelegate({
+    onfocusin: function () {
+      oRcCycleValueInput.setValueState(sap.ui.core.ValueState.None);
+      var inp = (oRcCycleValueInput.getDomRef() || {}).querySelector && oRcCycleValueInput.getDomRef().querySelector("input");
+      if (inp) {
+        inp.autocomplete = "off";
+        if (inp.setCustomValidity) inp.setCustomValidity("");
+        setTimeout(function () { inp.select(); }, 0);
+      }
+    }
+  });
   var oRcCycleValueRow = new sap.m.HBox({
     visible: true,
     items: [ new sap.m.Label({ text: 'Value:', width: '52px' }), oRcCycleValueInput ]
@@ -1820,12 +2419,78 @@ sap.ui.getCore().attachInit(function () {
   // End phase is initially the derived phase — disable its controls at startup
   setPhaseControlsEnabled('end', false);
 
+  // ── Add/Remove panel — lives at the left of the RC toolbar ───────────────
+  var oAddRemovePanel = new sap.m.Panel({
+    expandable: false, backgroundDesign: 'Transparent',
+    content: [ new sap.m.VBox({
+      alignItems: 'Center',
+      items: [
+        new sap.m.HBox({ items: [
+          new sap.m.Button({ text: "▲ Add Above", type: "Accept",  tooltip: "Add Above",                   press: function () { addProcessAt(0); } }),
+          new sap.m.Button({ text: "▼ Add Below", type: "Accept",  tooltip: "Add Below",                   press: function () { addProcessAt(1); } })
+        ]}),
+        new sap.m.HBox({ items: [
+          new sap.m.Button({ icon: "sap-icon://org-chart", text: "Add Sub", type: "Accept", tooltip: "Add As Subprocess (Shift+P)", press: function () { addNewProcess(); } }),
+          new sap.m.Button({ icon: "sap-icon://delete",    text: "Delete",  type: "Reject", tooltip: "Remove Process",             press: function () { removeProcess(); } })
+        ]})
+      ]
+    }) ]
+  }).addStyleClass('vtRcPanel vtRcAddRemovePanel');
+
+  var oAddRemoveBox = new sap.m.VBox({
+    alignItems: 'Center',
+    items: [
+      oAddRemovePanel,
+      new sap.m.Label({ text: 'Add/Delete Process' }).addStyleClass('vtAddRemoveLabel')
+    ]
+  }).addStyleClass('vtRcAddRemoveBox');
+
+  var oRcPhasesBox = new sap.m.VBox({
+    alignItems: 'Center',
+    items: [
+      new sap.m.HBox({
+        items: [ oRcStartPanel, oRcCyclePanel, oRcEndPanel ]
+      }).addStyleClass('vtRcPhasesContainer'),
+      new sap.m.Label({ text: 'Run Condition' }).addStyleClass('vtRcPhaseLabel')
+    ]
+  });
+
+  // ── Copy/Paste/Confirm panel — lives at the right of the RC toolbar ────────
+  var oCopyPastePanel = new sap.m.Panel({
+    expandable: false, backgroundDesign: 'Transparent',
+    content: [ new sap.m.HBox({
+      alignItems: 'Stretch',
+      items: [
+        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
+          new sap.m.Button({ icon: "sap-icon://copy",     type: "Default", tooltip: "Copy selected item(s)", press: function () { copyToClipboard(); } }),
+          new sap.m.Button({ icon: "sap-icon://scissors", type: "Default", tooltip: "Cut selected item(s)",  press: function () { cutToClipboard(); } })
+        ]}).addStyleClass('vtCPSection'),
+        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
+          new sap.m.Button({ icon: "sap-icon://org-chart", text: "Paste Sub",    type: "Default", tooltip: "Paste as subprocess of selected row",   press: function () { pasteFromClipboard('subprocess'); } }),
+          new sap.m.Button({ text: "▲ Paste Above",        type: "Default", tooltip: "Paste clipboard above selected row",                           press: function () { pasteFromClipboard('above'); } }),
+          new sap.m.Button({ text: "▼ Paste Below",        type: "Default", tooltip: "Paste clipboard below selected row",                           press: function () { pasteFromClipboard('below'); } })
+        ]}).addStyleClass('vtCPSection'),
+        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
+          new sap.m.Button({ icon: "sap-icon://accept", text: "Confirm", type: "Default", tooltip: "Remove (**copy) prefix from selected item(s) and subprocesses", press: function () { confirmCopiedItems(); } })
+        ]}).addStyleClass('vtCPSection')
+      ]
+    }) ]
+  }).addStyleClass('vtRcPanel vtRcAddRemovePanel vtCopyPastePanel');
+
+  var oCopyPasteBox = new sap.m.VBox({
+    alignItems: 'Center',
+    items: [
+      oCopyPastePanel,
+      new sap.m.Label({ text: 'Copy/Move' }).addStyleClass('vtAddRemoveLabel')
+    ]
+  }).addStyleClass('vtRcAddRemoveBox');
+
   // ── RC section: three GroupBox-style panels + status bar ─────────────────
   var oRcToolbar = new sap.m.VBox({
     width: '100%',
     items: [
       new sap.m.FlexBox({ wrap: 'Wrap', alignItems: 'Stretch', width: '100%',
-        items: [ oRcStartPanel, oRcCyclePanel, oRcEndPanel, new sap.m.ToolbarSpacer() ]
+        items: [ oAddRemoveBox, oRcPhasesBox, new sap.m.ToolbarSpacer(), oCopyPasteBox ]
       }),
       oRcStatusBar
     ]
@@ -1852,63 +2517,6 @@ sap.ui.getCore().attachInit(function () {
         type:    "Transparent",
         tooltip: "Collapse All",
         press:   function () { oTable.collapseAll(); }
-      }),
-      new sap.m.ToolbarSeparator(),
-      new sap.m.Button({
-        text:    "▲ Add Above",
-        type:    "Accept",
-        tooltip: "Add Above",
-        press:   function () { addProcessAt(0); }
-      }),
-      new sap.m.Button({
-        text:    "▼ Add Below",
-        type:    "Accept",
-        tooltip: "Add Below",
-        press:   function () { addProcessAt(1); }
-      }),
-      new sap.m.Button({
-        icon:    "sap-icon://org-chart",
-        type:    "Accept",
-        tooltip: "Add As Subprocess",
-        press:   function () { addNewProcess(); }
-      }),
-      new sap.m.Button({
-        icon:    "sap-icon://delete",
-        type:    "Reject",
-        tooltip: "Remove Process",
-        press:   function () { removeProcess(); }
-      }),
-      new sap.m.ToolbarSeparator(),
-      new sap.m.Button({
-        icon:    "sap-icon://copy",
-        type:    "Transparent",
-        tooltip: "Copy selected item(s)",
-        press:   function () { copyToClipboard(); }
-      }),
-      new sap.m.Button({
-        icon:    "sap-icon://scissors",
-        type:    "Transparent",
-        tooltip: "Cut selected item(s)",
-        press:   function () { cutToClipboard(); }
-      }),
-      new sap.m.Button({
-        text:    "▲ Paste Above",
-        type:    "Transparent",
-        tooltip: "Paste clipboard above selected row",
-        press:   function () { pasteFromClipboard('above'); }
-      }),
-      new sap.m.Button({
-        text:    "▼ Paste Below",
-        type:    "Transparent",
-        tooltip: "Paste clipboard below selected row",
-        press:   function () { pasteFromClipboard('below'); }
-      }),
-      new sap.m.Button({
-        icon:    "sap-icon://org-chart",
-        text:    "Paste Sub",
-        type:    "Transparent",
-        tooltip: "Paste clipboard as subprocess of selected row",
-        press:   function () { pasteFromClipboard('subprocess'); }
       }),
       new sap.m.ToolbarSpacer(),
       legendItem("brown",   "Station"),
@@ -1990,6 +2598,7 @@ sap.ui.getCore().attachInit(function () {
       if (oRcState.waitPhase) { cancelRcWait(); }
       else { clearRowHighlight(); }
     }
+    if (e.shiftKey && e.key === 'P') { e.preventDefault(); addNewProcess(); }
   });
 
   document.addEventListener('click', function (e) {

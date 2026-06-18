@@ -212,33 +212,36 @@ def get_records(op_number):
 
 
 def get_op_numbers():
-    """Return sorted list of distinct op_number values."""
+    """Return sorted list of distinct op_number values (sample data + explicitly created ops)."""
     if DB_PATH and os.path.exists(DB_PATH):
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(f"SELECT DISTINCT op_number FROM {TABLE_NAME} ORDER BY op_number")
         ops = [r[0] for r in cur.fetchall()]
         conn.close()
-        return ops
-    seen = {}
+        return sorted(set(ops) | OP_NUMBERS)
+    seen = set()
     result = []
     for r in SAMPLE_DATA:
         op = r["op_number"]
         if op not in seen:
-            seen[op] = True
+            seen.add(op)
+            result.append(op)
+    for op in OP_NUMBERS:
+        if op not in seen:
             result.append(op)
     return sorted(result)
 
 
 def build_tree(records):
-    """Convert flat record list into nested tree via parent_id / subprocess ordering."""
-    by_id = {r["item_id"]: dict(r, nodes=[]) for r in records}
+    """Convert flat list → nested tree using sub_process_items key (matches SAPUI5 frontend)."""
+    by_id = {r["item_id"]: dict(r, sub_process_items=[]) for r in records}
     roots = []
 
     for r in records:
         pid = r.get("parent_id") or ""
         if pid and pid in by_id:
-            by_id[pid]["nodes"].append(by_id[r["item_id"]])
+            by_id[pid]["sub_process_items"].append(by_id[r["item_id"]])
         else:
             roots.append(by_id[r["item_id"]])
 
@@ -251,10 +254,10 @@ def build_tree(records):
                     return order.index(c["item_id"])
                 except ValueError:
                     return 9999
-            node["nodes"].sort(key=rank)
+            node["sub_process_items"].sort(key=rank)
         else:
-            node["nodes"].sort(key=lambda c: c.get("tree_index") or 0)
-        for child in node["nodes"]:
+            node["sub_process_items"].sort(key=lambda c: c.get("tree_index") or 0)
+        for child in node["sub_process_items"]:
             sort_node(child)
 
     roots.sort(key=lambda r: r.get("tree_index") or 0)
@@ -262,6 +265,16 @@ def build_tree(records):
         sort_node(root)
 
     return roots
+
+
+# ── In-memory metadata (used when no real DB is configured) ───────────────────
+JOB_METADATA = {
+    "job_number": "", "job_title": "", "job_description": "",
+    "target_cycle_time": 60,
+    "machine_list": [], "robot_list": [], "operator_list": []
+}
+OP_METADATA = {}   # op_number → { op_title, op_description, num_of_parts }
+OP_NUMBERS  = set()  # op numbers created via API but not yet in SAMPLE_DATA
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -286,8 +299,18 @@ def api_tree():
 @app.route("/updateDB", methods=["POST"])
 def api_update_db():
     data       = request.get_json() or {}
-    updated_db = data.get("updated_db", [])
+    updated_db = data.get("cycle_general_structure", data.get("updated_db", []))
     op_number  = data.get("op_number", "")
+
+    # Persist job_metadata for this op if provided
+    job_meta = data.get("job_metadata")
+    if job_meta and op_number:
+        OP_METADATA[op_number] = {
+            "op_title":       job_meta.get("op_title") or "",
+            "op_description": job_meta.get("job_description") or "",
+            "num_of_parts":   job_meta.get("num_of_parts", 1),
+        }
+        OP_NUMBERS.add(op_number)
 
     # Flatten nested tree → flat list of DB records
     flat = []
@@ -330,6 +353,128 @@ def api_update_db():
         "data":          [],
         "message":       "Updated {} record(s) for {}".format(len(flat), op_number)
     })
+
+
+@app.route("/updateOpNumbers", methods=["POST"])
+def api_update_op_numbers():
+    return jsonify({"data": get_op_numbers()})
+
+
+@app.route("/updateTree", methods=["POST"])
+def api_update_tree():
+    data = request.get_json() or {}
+    op   = data.get("op_number", "")
+    records  = get_records(op)
+    tree     = build_tree(records)
+    max_end  = max((r.get("cycle_end") or 0.0 for r in records), default=0.0)
+    return jsonify({"data": tree, "maxCycleEnd": max_end})
+
+
+@app.route("/api/job_metadata", methods=["GET"])
+def api_get_job_metadata():
+    return jsonify(JOB_METADATA)
+
+
+@app.route("/api/job_metadata", methods=["POST"])
+def api_save_job_metadata():
+    data = request.get_json() or {}
+    JOB_METADATA.update(data)
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/op_metadata/<op_number>", methods=["GET"])
+def api_get_op_metadata(op_number):
+    meta = OP_METADATA.get(op_number, {"op_title": "", "op_description": "", "num_of_parts": 1})
+    return jsonify(meta)
+
+
+@app.route("/api/op_metadata/<op_number>", methods=["POST"])
+def api_save_op_metadata(op_number):
+    data = request.get_json() or {}
+    OP_METADATA[op_number] = {
+        "op_title":       data.get("op_title", ""),
+        "op_description": data.get("op_description", ""),
+        "num_of_parts":   data.get("num_of_parts", 1)
+    }
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/op/create", methods=["POST"])
+def api_create_op():
+    data      = request.get_json() or {}
+    op_number = data.get("op_number", "")
+    if not op_number:
+        return jsonify({"status": "error", "message": "op_number is required"}), 400
+    if op_number in get_op_numbers():
+        return jsonify({"status": "error", "message": f"Op '{op_number}' already exists"}), 409
+    OP_NUMBERS.add(op_number)
+    OP_METADATA[op_number] = {
+        "op_title":       data.get("op_title", ""),
+        "op_description": data.get("op_description", ""),
+        "num_of_parts":   data.get("num_of_parts", 1)
+    }
+    return jsonify({"status": "success", "op_number": op_number})
+
+
+@app.route("/api/op/<op_number>", methods=["DELETE"])
+def api_delete_op(op_number):
+    global SAMPLE_DATA
+    SAMPLE_DATA = [r for r in SAMPLE_DATA if r["op_number"] != op_number]
+    OP_NUMBERS.discard(op_number)
+    OP_METADATA.pop(op_number, None)
+    return jsonify({"status": "success"})
+
+
+@app.route("/removeProcess", methods=["POST"])
+def api_remove_process():
+    global SAMPLE_DATA
+    data      = request.get_json() or {}
+    op_number = data.get("op_number", "")
+    if not op_number:
+        return jsonify({"status": "error", "message": "op_number is required"}), 400
+    SAMPLE_DATA = [r for r in SAMPLE_DATA if r["op_number"] != op_number]
+    OP_NUMBERS.discard(op_number)
+    OP_METADATA.pop(op_number, None)
+    return jsonify({
+        "status":  "success",
+        "message": f"Op '{op_number}' removed"
+    })
+
+
+@app.route("/api/op/duplicate", methods=["POST"])
+def api_duplicate_op():
+    import uuid
+    data      = request.get_json() or {}
+    source_op = data.get("source_op", "")
+    new_op    = data.get("new_op", "")
+    if not source_op or not new_op:
+        return jsonify({"status": "error", "message": "source_op and new_op are required"}), 400
+    if new_op in get_op_numbers():
+        return jsonify({"status": "error", "message": f"Op '{new_op}' already exists"}), 409
+    source_records = [r for r in SAMPLE_DATA if r["op_number"] == source_op]
+    if not source_records and source_op not in OP_NUMBERS:
+        return jsonify({"status": "error", "message": f"Op '{source_op}' not found"}), 404
+
+    id_map  = {r["item_id"]: "cp" + uuid.uuid4().hex[:6] for r in source_records}
+    max_id  = max((r["id"] for r in SAMPLE_DATA), default=0)
+    new_recs = []
+    for i, r in enumerate(source_records):
+        nr = dict(r)
+        nr["op_number"] = new_op
+        nr["item_id"]   = id_map[r["item_id"]]
+        nr["parent_id"] = id_map.get(r.get("parent_id", ""), r.get("parent_id", ""))
+        if r.get("subprocess"):
+            nr["subprocess"] = ",".join(
+                id_map.get(s.strip(), s.strip()) for s in r["subprocess"].split(",")
+            )
+        nr["id"] = max_id + i + 1
+        new_recs.append(nr)
+
+    SAMPLE_DATA.extend(new_recs)
+    OP_NUMBERS.add(new_op)
+    src_meta = OP_METADATA.get(source_op, {})
+    OP_METADATA[new_op] = dict(src_meta)
+    return jsonify({"status": "success", "op_number": new_op})
 
 
 if __name__ == "__main__":
