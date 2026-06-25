@@ -428,17 +428,55 @@ def api_delete_op(op_number):
 @app.route("/removeProcess", methods=["POST"])
 def api_remove_process():
     global SAMPLE_DATA
-    data      = request.get_json() or {}
-    op_number = data.get("op_number", "")
-    if not op_number:
-        return jsonify({"status": "error", "message": "op_number is required"}), 400
-    SAMPLE_DATA = [r for r in SAMPLE_DATA if r["op_number"] != op_number]
-    OP_NUMBERS.discard(op_number)
-    OP_METADATA.pop(op_number, None)
-    return jsonify({
-        "status":  "success",
-        "message": f"Op '{op_number}' removed"
-    })
+    data    = request.get_json() or {}
+    item_id = data.get("item_id", "")
+    if not item_id:
+        return jsonify({"status": "error", "message": "item_id is required"}), 400
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        cur.execute(f"DELETE FROM {TABLE_NAME} WHERE item_id = ?", (item_id,))
+        conn.commit()
+        deleted = cur.rowcount
+        conn.close()
+    else:
+        before = len(SAMPLE_DATA)
+        SAMPLE_DATA = [r for r in SAMPLE_DATA if r.get("item_id") != item_id]
+        deleted = before - len(SAMPLE_DATA)
+
+    return jsonify({"status": "success", "deleted": deleted})
+
+
+@app.route("/deleteDBItem", methods=["POST"])
+def api_delete_db_item():
+    global SAMPLE_DATA
+    filters = request.get_json() or {}
+    if not filters:
+        return jsonify({"status": "error", "message": "filter dict is required"}), 400
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        where = " AND ".join(f"{k} = ?" for k in filters)
+        cur.execute(f"DELETE FROM {TABLE_NAME} WHERE {where}", list(filters.values()))
+        conn.commit()
+        deleted = cur.rowcount
+        conn.close()
+    else:
+        before = len(SAMPLE_DATA)
+        SAMPLE_DATA = [
+            r for r in SAMPLE_DATA
+            if not all(str(r.get(k)) == str(v) for k, v in filters.items())
+        ]
+        deleted = before - len(SAMPLE_DATA)
+        # clean up in-memory op tracking if op_number was the filter
+        op = filters.get("op_number")
+        if op:
+            OP_NUMBERS.discard(str(op))
+            OP_METADATA.pop(str(op), None)
+
+    return jsonify({"status": "success", "deleted": deleted})
 
 
 @app.route("/api/op/duplicate", methods=["POST"])

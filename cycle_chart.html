@@ -90,6 +90,8 @@ sap.ui.getCore().attachInit(function () {
   var maxCycleEnd = 500;   // updated after each API call
   var nAutoExpandLevel = 0;
 
+  var _opsToDelete = [];  // ops queued for deletion, flushed on saveToDb
+
   // In-memory metadata — no server calls until the Save button is pressed
   var _jobState = {
     job_number: "", job_title: "", job_description: "",
@@ -570,6 +572,17 @@ sap.ui.getCore().attachInit(function () {
   // ── Row highlight helpers ─────────────────────────────────────────────────
   var _rowClickHandled = false;
   var _ctrlKeyHeld     = false;
+  var _shiftKeyHeld    = false;
+  var _anchorItemId    = null;   // anchor for Shift range selection
+
+  function flattenInOrder(items, out) {
+    out = out || [];
+    (items || []).forEach(function (item) {
+      out.push(item);
+      flattenInOrder(item.sub_process_items || [], out);
+    });
+    return out;
+  }
 
   // Stamps a CSS class on BOTH the fixed-column TR and the scroll-column TR so that
   // all columns (including the fixed "Cycle Description" column) are covered.
@@ -659,7 +672,21 @@ sap.ui.getCore().attachInit(function () {
       refreshRcToolbar(item);
     }
 
-    if (_ctrlKeyHeld) {
+    if (_shiftKeyHeld && _anchorItemId) {
+      // Shift+click: select all rows between anchor and clicked item (inclusive)
+      var flat = flattenInOrder(oDataModel.getProperty("/items"));
+      var anchorIdx = -1, clickedIdx = -1;
+      for (var i = 0; i < flat.length; i++) {
+        if (flat[i].item_id === _anchorItemId) anchorIdx = i;
+        if (flat[i].item_id === oObj.item_id)  clickedIdx = i;
+      }
+      if (anchorIdx >= 0 && clickedIdx >= 0) {
+        var lo = Math.min(anchorIdx, clickedIdx);
+        var hi = Math.max(anchorIdx, clickedIdx);
+        oRcState.activeItemIds = flat.slice(lo, hi + 1).map(function (it) { return it.item_id; });
+      }
+      setReference(oObj);
+    } else if (_ctrlKeyHeld) {
       // Ctrl+click: toggle this item in/out of the multi-selection
       var idx = oRcState.activeItemIds.indexOf(oObj.item_id);
       if (idx >= 0) {
@@ -673,11 +700,13 @@ sap.ui.getCore().attachInit(function () {
       } else {
         oRcState.activeItemIds.push(oObj.item_id);
         setReference(oObj);
+        _anchorItemId = oObj.item_id;
       }
     } else {
       // Normal click: select only this item (clears any prior multi-selection)
       oRcState.activeItemIds = [oObj.item_id];
       setReference(oObj);
+      _anchorItemId = oObj.item_id;
     }
 
     applyRowHighlight();
@@ -1085,6 +1114,7 @@ sap.ui.getCore().attachInit(function () {
       sap.m.MessageToast.show("Selected item not found");
       return;
     }
+    var itemId = selItem.item_id;
 
     // Capture siblings context BEFORE deletion so we know who comes next
     var flatMap0    = buildFlatMap(items, {});
@@ -1100,6 +1130,15 @@ sap.ui.getCore().attachInit(function () {
     }
 
     recalcTree();
+
+    fetch(API_BASE + '/removeProcess', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ item_id: itemId })
+    })
+      .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
+      .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
+
     sap.m.MessageToast.show("Process removed");
   }
 
@@ -1318,9 +1357,10 @@ sap.ui.getCore().attachInit(function () {
     var payload = {
       cycle_general_structure: stripClientFields(items),
       job_metadata:            _buildJobMetadata(op, items),
-      op_number:               op
+      op_number:               op,
+      ops_to_delete:           _opsToDelete.slice()
     };
-    console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length);
+    console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length, " ops_to_delete:", _opsToDelete);
 
     fetch(API_BASE + "/updateDB", {
       method:  "POST",
@@ -1330,6 +1370,7 @@ sap.ui.getCore().attachInit(function () {
       .then(function (r) { console.log("[ValiantTMS] /updateDB:", r.status); })
       .catch(function (err) { console.warn("[ValiantTMS] /updateDB response error:", err.message); });
 
+    _opsToDelete = [];
     sap.m.MessageToast.show("Saved");
   }
 
@@ -2204,38 +2245,17 @@ sap.ui.getCore().attachInit(function () {
       new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate Op",
         press: function () { openDupOpDialog(); }
       }),
-      new sap.m.Button({ icon: "sap-icon://delete", type: "Transparent", tooltip: "Delete Op",
+      new sap.m.Button({ icon: "sap-icon://delete", type: "Reject", tooltip: "Delete Op",
         press: function () {
           var op = oOpSelect.getSelectedKey();
           if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
-          sap.m.MessageBox.confirm('Delete Op ' + op + ' and all its processes?', {
-            onClose: function (action) {
-              if (action !== 'OK') return;
-              var treeData = stripClientFields(_opTreeCache[op] || []);
-              delete _opTreeCache[op];
-              delete _opMetaMap[op];
-              var allItems = oOpSelect.getItems();
-              var idx = 0;
-              for (var k = 0; k < allItems.length; k++) { if (allItems[k].getKey() === op) { idx = k; break; } }
-              oOpSelect.removeItem(allItems[idx]);
-              var remaining = oOpSelect.getItems();
-              if (remaining.length > 0) {
-                var nextKey = remaining[Math.max(0, idx - 1)].getKey();
-                oOpSelect.setSelectedKey(nextKey);
-                if (_opTreeCache[nextKey]) { _loadTreeFromCache(nextKey); } else { loadTree(nextKey); }
-              } else {
-                oDataModel.setData({ items: [], maxCycleEnd: 500 });
-              }
-              fetch(API_BASE + '/removeProcess', {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({ op_number: op, data: treeData })
-              })
-                .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
-                .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
-              sap.m.MessageToast.show('Op ' + op + ' deleted.');
-            }
-          });
+          if (!window.confirm('Are you sure you want to delete Op "' + op + '"?\nThis cannot be undone.')) return;
+          _opsToDelete.push(op);
+          var allItems = oOpSelect.getItems();
+          for (var k = 0; k < allItems.length; k++) {
+            if (allItems[k].getKey() === op) { oOpSelect.removeItem(allItems[k]); break; }
+          }
+          sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
         }
       }),
       new sap.m.ToolbarSpacer(),
@@ -2590,7 +2610,7 @@ sap.ui.getCore().attachInit(function () {
   // ── Global keyboard + background-click handlers ───────────────────────────
   // Capture phase fires before SAPUI5 processes the click, so __vtOnItemClick
   // can read _ctrlKeyHeld reliably.
-  document.addEventListener('click', function (e) { _ctrlKeyHeld = e.ctrlKey; }, true);
+  document.addEventListener('click', function (e) { _ctrlKeyHeld = e.ctrlKey; _shiftKeyHeld = e.shiftKey; }, true);
 
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && oRcState.waitPhase) { e.preventDefault(); commitRcWait(); return; }
@@ -2598,7 +2618,11 @@ sap.ui.getCore().attachInit(function () {
       if (oRcState.waitPhase) { cancelRcWait(); }
       else { clearRowHighlight(); }
     }
-    if (e.shiftKey && e.key === 'P') { e.preventDefault(); addNewProcess(); }
+    if (e.shiftKey && e.key === 'P') { e.preventDefault(); addNewProcess(); return; }
+    var mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key === 'c') { e.preventDefault(); copyToClipboard(); }
+    if (mod && e.key === 'x') { e.preventDefault(); cutToClipboard(); }
+    if (mod && e.key === 'v') { e.preventDefault(); pasteFromClipboard('subprocess'); }
   });
 
   document.addEventListener('click', function (e) {
