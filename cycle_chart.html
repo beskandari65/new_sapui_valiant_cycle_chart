@@ -74,6 +74,21 @@
     .vtDialogForm > .sapMHBox { margin-bottom: 8px; }
     .vtDialogForm > .sapMHBox > .sapMLabel { padding-top: 7px; flex-shrink: 0; }
 
+    /* Gantt bar tooltip */
+    #vtTooltip { position:fixed;z-index:9999;display:none;pointer-events:none;
+                 box-shadow:0 4px 16px rgba(0,0,0,.25);font-size:12px;line-height:1.6; }
+
+    /* Cycle Time Calculator */
+    .vtCalcGenBox  { padding: 8px; }
+    .vtCalcGenBox > * { margin-bottom: 4px !important; }
+    .vtCalcOpLabel.sapMText { font-size: 0.8rem; color: #888; text-align: right; min-height: 18px; width: 100%; }
+    .vtCalcTravelResult.sapMText { font-size: 1.1rem; font-weight: 700; color: #0854a0; }
+    .vtProcFormulaBox { padding: 0 12px; border-left: 1px solid #e0e0e0; min-width: 260px; }
+    .vtMatrixDisplay  { background: #f7f9fb; border: 1px solid #e0e0e0; border-radius: 4px; padding: 4px 8px; min-height: 44px; }
+    .vtMxItemRow { padding: 2px 0; border-bottom: 1px solid #f0f0f0; }
+    .vtMxItemRow > .vtMxItemText { flex: 1 1 0 !important; min-width: 0 !important; font-size: 0.78rem !important; padding-right: 4px !important; }
+    .vtMxItemRow > .vtMxTimeText { font-size: 0.78rem !important; color: #888 !important; width: 44px !important; flex-shrink: 0 !important; text-align: right !important; }
+
   </style>
 </head>
 <body class="sapUiBody">
@@ -153,7 +168,8 @@ sap.ui.getCore().attachInit(function () {
     EQUAL_TO:        'Equal to',
     SEQUENTIAL:      'Sequential',
     SYNC_START:      'Sync Start',
-    SYNC_COMPLETION: 'Sync Completion'
+    SYNC_COMPLETION: 'Sync Completion',
+    CYCLE_CALC:      'Cycle Time Cal'
   };
 
   // ── RC parse / serialize ───────────────────────────────────────────────────
@@ -283,6 +299,10 @@ sap.ui.getCore().attachInit(function () {
     } else if (cond === RC_COND.EQUAL_TO) {
       var ref = flatMap[vals[vals.length - 1]];
       if (ref && ref.cycle_time != null) item.cycle_time = r2(ref.cycle_time);
+
+    } else if (cond === RC_COND.CYCLE_CALC) {
+      var v = parseFloat((vals[0] || '').split('=').pop().trim());
+      if (!isNaN(v)) item.cycle_time = r2(v);
 
     } else if (cond === RC_COND.SUBPROCESS) {
       var children = item.sub_process_items || [];
@@ -839,9 +859,14 @@ sap.ui.getCore().attachInit(function () {
 
     var ck = cA && rc.cycle ? rc.cycle.condition : '';
     var cycleIsCustom = ck === RC_COND.CUSTOM_VALUE;
+    var cycleIsCalc   = ck === RC_COND.CYCLE_CALC;
     oRcCycleValueInput.setEnabled(cA && cycleIsCustom);
     if (cycleIsCustom && rc.cycle && rc.cycle.values.length)
       oRcCycleValueInput.setValue(parseFloat(rc.cycle.values[0]) || 0);
+    if (cycleIsCalc && rc.cycle && rc.cycle.values.length) {
+      var calcNum = parseFloat((rc.cycle.values[0] || '').split('=').pop().trim());
+      if (!isNaN(calcNum)) oRcCycleValueInput.setValue(calcNum);
+    }
 
     var ek = eA && rc.end ? rc.end.condition : '';
     oRcEndValueRow.setVisible(ek === RC_COND.CUSTOM_VALUE);
@@ -882,6 +907,7 @@ sap.ui.getCore().attachInit(function () {
     switch (cond) {
       case RC_COND.CUSTOM_VALUE: /* user types in Value field */                                                 break;
       case RC_COND.EQUAL_TO:     enterRcWait('cycle', RC_COND.EQUAL_TO, 'click a process for Equal Cycle Time'); break;
+      case RC_COND.CYCLE_CALC:   openCycleCalcDialog();                                                          break;
     }
   }
 
@@ -1439,6 +1465,78 @@ sap.ui.getCore().attachInit(function () {
     oInput.addEventListener("blur", cancel);
   };
 
+  // ── Gantt bar tooltip ────────────────────────────────────────────────────
+  (function () {
+    var el = document.createElement('div');
+    el.id  = 'vtTooltip';
+    document.body.appendChild(el);
+  }());
+
+  document.addEventListener('mousemove', function (e) {
+    var tip = document.getElementById('vtTooltip');
+    if (tip && tip.style.display !== 'none') _vtPositionTooltip(e);
+  });
+
+  function _vtPositionTooltip(e) {
+    var tip = document.getElementById('vtTooltip'); if (!tip) return;
+    var x = e.clientX + 16, y = e.clientY + 16;
+    if (x + tip.offsetWidth  > window.innerWidth  - 10) x = e.clientX - tip.offsetWidth  - 16;
+    if (y + tip.offsetHeight > window.innerHeight - 10) y = e.clientY - tip.offsetHeight - 16;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  }
+
+  function _buildRcTooltipHtml(rcStr, flatMap) {
+    if (!rcStr || rcStr === '{}') return '';
+    var json; try { json = JSON.parse(rcStr); } catch (e) { return ''; }
+    var rows = [];
+    ['Start', 'Cycle', 'End'].forEach(function (phase) {
+      var pd = json[phase]; if (!pd) return;
+      var condition = null, values = [], offset = null;
+      Object.keys(pd).forEach(function (k) {
+        if (k === 'Offset') { if (pd[k] && pd[k][0]) offset = pd[k][0]; }
+        else                { condition = k; values = pd[k] || []; }
+      });
+      if (!condition) return;
+      var extra = (offset && parseFloat(offset) !== 0) ? ' (' + offset + 's offset)' : '';
+      var vParts = values.map(function (v) {
+        var ref = flatMap && flatMap[v];
+        return ref ? '&nbsp;&nbsp;&nbsp;' + (ref.step || '') + '&gt; ' + (ref.title || v)
+                   : '&nbsp;&nbsp;&nbsp;' + v;
+      });
+      var htmlV = vParts.length ? '<br><em>' + vParts.join('<br>') + '</em>' : '';
+      rows.push((phase === 'Start' || phase === 'End')
+        ? '<strong>' + phase + 's ' + condition + extra + '</strong>' + htmlV + '<br><br>'
+        : '<strong>Cycle time: (' + condition + extra + ')</strong>' + htmlV + '<br><br>');
+    });
+    return rows.join('');
+  }
+
+  window._vtShowTooltip = function (itemId, event) {
+    var flatMap = buildFlatMap(oDataModel.getProperty('/items'), {});
+    var item    = flatMap[itemId]; if (!item) return;
+    var T  = '#0854a0';
+    var s  = item.cycle_start != null ? (+item.cycle_start).toFixed(2) : '—';
+    var en = item.cycle_end   != null ? (+item.cycle_end).toFixed(2)   : '—';
+    var ct = item.cycle_time  != null ? (+item.cycle_time).toFixed(2)  : '—';
+    var html = '<div style="color:' + T + ';background:#fff;padding:8px;border:1px solid green;border-radius:8px;min-width:200px;max-width:340px;">';
+    html += '<div style="color:white;background:' + T + ';padding:4px 8px;margin:-8px -8px 8px -8px;border-radius:6px 6px 0 0;">' +
+            '<strong>' + (item.step || '') + '&gt; ' + (item.title || '') + '</strong></div>';
+    html += '<strong>Start:</strong> <em style="color:green">'      + s  + 's</em><br>';
+    html += '<strong>End:</strong> <em style="color:green">'        + en + 's</em><br>';
+    html += '<strong>Cycle Time:</strong> <em style="color:green">' + ct + 's</em><br>';
+    html += '<strong>Cycle Type:</strong> <em style="color:green">' + (item.cycle_type || '—') + '</em><br><br>';
+    html += _buildRcTooltipHtml(item.run_cond_config, flatMap);
+    html += '</div>';
+    var tip = document.getElementById('vtTooltip');
+    tip.innerHTML = html; tip.style.display = 'block';
+    _vtPositionTooltip(event);
+  };
+
+  window._vtHideTooltip = function () {
+    var tip = document.getElementById('vtTooltip');
+    if (tip) tip.style.display = 'none';
+  };
+
   // ── Custom CycleBar control ───────────────────────────────────────────────
   //   Mirrors the React ProgressBar rules:
   //     parent_item (Station / Process group) → transparent bg + dashed border
@@ -1452,7 +1550,8 @@ sap.ui.getCore().attachInit(function () {
         color:           { type: "string", defaultValue: "#09528A" },
         scaleFactor:     { type: "float",  defaultValue: 2 },
         cycleType:       { type: "string", defaultValue: "Undefined" },
-        ancestorEnds:    { type: "string", defaultValue: "" }
+        ancestorEnds:    { type: "string", defaultValue: "" },
+        itemId:          { type: "string", defaultValue: "" }
       }
     },
     renderer: function (oRm, oCtrl) {
@@ -1461,12 +1560,10 @@ sap.ui.getCore().attachInit(function () {
       var time    = oCtrl.getCycleTime()   || 0;
       var color   = oCtrl.getColor()       || "#09528A";
       var ct      = oCtrl.getCycleType()   || "Undefined";
+      var iid     = oCtrl.getItemId()     || "";
       if (ct === "Station") { color = "brown"; }  // always brown, regardless of DB value
       var spacerW = Math.ceil(start * sf);
       var barW    = Math.max(2, Math.ceil(time * sf));
-      var tip     = "Start: "    + start.toFixed(2) + " s" +
-                    "  |  Cycle: " + time.toFixed(2)  + " s" +
-                    "  |  End: "   + (start + time).toFixed(2) + " s";
 
       // Bar visual rules (matches React ProgressBar parent_item logic)
       var barH, barBg, barBorder, barShadow;
@@ -1509,7 +1606,9 @@ sap.ui.getCore().attachInit(function () {
 
       // Bar — solid for leaves, dashed outline for parents
       oRm.write(
-        '<div title="' + tip + '" style="display:inline-block;flex-shrink:0;' +
+        '<div onmouseenter="window._vtShowTooltip(\'' + iid + '\',event)"' +
+        ' onmouseleave="window._vtHideTooltip()"' +
+        ' style="display:inline-block;flex-shrink:0;' +
         'width:' + barW + 'px;height:' + barH + 'px;' +
         'background:' + barBg + ';' +
         (barBorder !== "none" ? 'border:' + barBorder + ';border-bottom:none;' : '') +
@@ -1645,7 +1744,8 @@ sap.ui.getCore().attachInit(function () {
                  color:          "{color}",
                  scaleFactor:    "{settings>/scaleFactor}",
                  cycleType:      "{cycle_type}",
-                 ancestorEnds:   "{_ancestorEnds}"
+                 ancestorEnds:   "{_ancestorEnds}",
+                 itemId:         "{item_id}"
                }),
     width:     (Math.ceil(scaleFactor * maxCycleEnd) + 50) + "px",
     resizable: false
@@ -1710,6 +1810,49 @@ sap.ui.getCore().attachInit(function () {
                    }),
         width:     "90px",
         hAlign:    "End",
+        resizable: true
+      }),
+      new sap.ui.table.Column({
+        label:    new sap.m.Label({ text: "Cycle Time Details" }),
+        template: new sap.m.FormattedText({
+          htmlText: {
+            parts: [{ path: 'run_cond_config' }, { path: 'parent_id' }],
+            formatter: function (rcStr, parentId) {
+              var T  = '#0854a0';
+              var rc = parseRC(rcStr);
+              if (!rc.cycle) return '-';
+              var cond   = rc.cycle.condition;
+              var vals   = rc.cycle.values || [];
+              var hasVal = vals.length > 0 && String(vals[0]).trim() !== '';
+              var valStr = vals.join(', ');
+
+              if (hasVal) {
+                if (cond === RC_COND.EQUAL_TO) {
+                  var refId   = vals[vals.length - 1];
+                  var flatMap = buildFlatMap(oDataModel.getProperty('/items'), {});
+                  var ref     = flatMap[refId];
+                  if (!ref) return '<span style="color:red"><strong>' + cond + '</strong>: <em>not found</em></span>';
+                  return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + (ref.step || refId) + '</em></span>';
+                }
+                if (cond === RC_COND.CUSTOM_VALUE) {
+                  return '<span style="color:red"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
+                }
+                if (cond === RC_COND.CYCLE_CALC) {
+                  return '<span style="color:' + T + '"><em>' + valStr + '</em></span>';
+                }
+                return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
+              }
+
+              if (cond) {
+                if (cond === RC_COND.SUBPROCESS && !parentId) return '<em>Station</em>';
+                return '<em>' + cond + '</em>';
+              }
+
+              return '-';
+            }
+          }
+        }),
+        width:     "240px",
         resizable: true
       })
     ]
@@ -2334,13 +2477,294 @@ sap.ui.getCore().attachInit(function () {
     content: [ new sap.m.VBox({ items: [ oRcStartSelect, oRcStartValueRow, oRcStartOffsetRow ] }) ]
   }).addStyleClass('vtRcPanel');
 
+  // ── Cycle Time Calculator ─────────────────────────────────────────────────
+
+  var _calcResults = { general: '', processing: '', travel: '', matrix: '' };
+
+  // ─ Tab 1 · General Calculator ─────────────────────────────────────────────
+  var oCalcOpLabel = new sap.m.Text({ text: '', wrapping: false }).addStyleClass('vtCalcOpLabel');
+  var oCalcDisplay = new sap.m.Input({ value: '0', textAlign: 'End', width: '100%' });
+
+  var _calcInsert = function (ch) {
+    var v = oCalcDisplay.getValue();
+    if (v === '0' || v === 'Error') v = '';
+    oCalcDisplay.setValue(v + ch);
+  };
+  var _calcBack = function () {
+    var v = oCalcDisplay.getValue();
+    oCalcDisplay.setValue(v.length > 1 ? v.slice(0, -1) : '0');
+  };
+  var _calcCompute = function () {
+    var expr = oCalcDisplay.getValue();
+    try {
+      var result = Math.round(eval(expr.replace(/×/g, '*').replace(/÷/g, '/')) * 100) / 100; // jshint ignore:line
+      var pretty  = expr.replace(/\*/g, '×').replace(/\//g, '÷');
+      var formula = pretty + ' = ' + result;
+      oCalcOpLabel.setText(formula);
+      oCalcDisplay.setValue(String(result));
+      _calcResults.general = formula;
+    } catch (e) { oCalcDisplay.setValue('Error'); }
+  };
+  var _calcOnBtn = function (t) {
+    if (t === 'C')  { oCalcDisplay.setValue('0'); oCalcOpLabel.setText(''); _calcResults.general = ''; return; }
+    if (t === '⌫') { _calcBack(); return; }
+    if (t === '=')  { _calcCompute(); return; }
+    _calcInsert(t);
+  };
+  var oCalcBtnBox = (function () {
+    var ROWS = [['(',')', '⌫','/'],['7','8','9','*'],['4','5','6','-'],['1','2','3','+'],['0','.','C','=']];
+    var vb = new sap.m.VBox({ width: '100%' });
+    ROWS.forEach(function (row) {
+      var hb = new sap.m.HBox({ justifyContent: 'SpaceAround', width: '100%' });
+      row.forEach(function (t) {
+        hb.addItem(new sap.m.Button({
+          text: t, width: '58px',
+          type: t === '=' ? 'Emphasized' : '+-*/()'.indexOf(t) >= 0 ? 'Ghost' : 'Transparent',
+          press: (function (ch) { return function () { _calcOnBtn(ch); }; })(t)
+        }));
+      });
+      vb.addItem(hb);
+    });
+    return vb;
+  }());
+
+  // ─ Tab 2 · Processing ─────────────────────────────────────────────────────
+  var _procWeldLengthInputs = [];
+  var oCalcProcLengthsBox   = new sap.m.VBox({});
+  var oCalcProcFormula      = new sap.m.FormattedText({ htmlText: '' });
+
+  var _procPType = new sap.m.Select({
+    width: '150px',
+    selectedKey: 'Welding',
+    items: [ new sap.ui.core.Item({ key: 'Welding', text: 'Welding' }), new sap.ui.core.Item({ key: 'Inspection', text: 'Inspection' }) ],
+    change: function () { _updateProcResult(); }
+  });
+  var _mkPI = function (v) {
+    return new sap.m.StepInput({ value: v, min: 0, max: 1e6, step: 0.1, width: '115px', change: function () { _updateProcResult(); } });
+  };
+  var _procTps = _mkPI(0.9); var _procTpe = _mkPI(0.9); var _procV    = _mkPI(10);
+  var _procTpre= _mkPI(2);   var _procTint= _mkPI(1);   var _procTpost= _mkPI(2);
+  var _procN = new sap.m.StepInput({ value: 1, min: 1, max: 50, step: 1, width: '115px',
+    change: function () { _rebuildProcLengths(); _updateProcResult(); }
+  });
+
+  var _rebuildProcLengths = function () {
+    oCalcProcLengthsBox.removeAllItems();
+    _procWeldLengthInputs = [];
+    var n = parseInt(_procN.getValue(), 10) || 1;
+    for (var i = 1; i <= n; i++) {
+      var si = new sap.m.StepInput({ value: 10, min: 0, max: 1e6, step: 0.5, width: '115px', change: function () { _updateProcResult(); } });
+      _procWeldLengthInputs.push(si);
+      oCalcProcLengthsBox.addItem(new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare',
+        items: [ new sap.m.Label({ text: 'Length ' + i + ' (mm):', width: '110px' }), si ]
+      }));
+    }
+  };
+
+  var _updateProcResult = function () {
+    var tps = +_procTps.getValue()||0, tpe = +_procTpe.getValue()||0, v = +_procV.getValue()||0.01;
+    var tpre= +_procTpre.getValue()||0, tint= +_procTint.getValue()||0, tpost= +_procTpost.getValue()||0;
+    var n   = parseInt(_procN.getValue(), 10)||1;
+    var L   = Math.round(_procWeldLengthInputs.reduce(function (s, si) { return s + (+si.getValue()||0); }, 0)*100)/100;
+    var total = Math.round((tpre + n*(tps+tpe) + L/v + (n-1)*tint + tpost)*100)/100;
+    var fs  = tpre+' + '+n+'('+tps+'+'+tpe+') + '+L+'/'+v+' + ('+n+'-1)'+tint+' + '+tpost;
+    _calcResults.processing = _procPType.getSelectedKey()+': '+fs+' = '+total;
+    oCalcProcFormula.setHtmlText(
+      '<p style="text-align:center;font-size:13px;color:#555"><em>T = t<sub>pre</sub> + N(t<sub>ps</sub>+t<sub>pe</sub>) + L/v + (N−1)t<sub>int</sub> + t<sub>post</sub></em></p>'+
+      '<hr style="border:0;border-top:1px solid #ddd">'+
+      '<p style="text-align:center;font-size:12px;color:#666">'+fs+'</p>'+
+      '<p style="text-align:center;font-size:15px;font-weight:bold;color:#0854a0">T = '+total+' s</p>'
+    );
+  };
+
+  // ─ Tab 3 · Travel ─────────────────────────────────────────────────────────
+  var oCalcTravelResult = new sap.m.Text({ text: '— s' }).addStyleClass('vtCalcTravelResult');
+  var oCalcDistInput    = new sap.m.StepInput({ value: 150, min: 0,    max: 1e6, step: 1,   width: '115px', change: function () { _updateTravelResult(); } });
+  var oCalcSpeedInput   = new sap.m.StepInput({ value: 10,  min: 0.01, max: 1e6, step: 0.5, width: '115px', change: function () { _updateTravelResult(); } });
+  var _updateTravelResult = function () {
+    var d = +oCalcDistInput.getValue(), s = +oCalcSpeedInput.getValue()||0.01;
+    var t = Math.round(d/s*100)/100;
+    oCalcTravelResult.setText(t + ' s');
+    _calcResults.travel = d+'mm ÷ '+s+'mm/s = '+t;
+  };
+
+  // ─ Tab 4 · Matrix ─────────────────────────────────────────────────────────
+  var _matrixCatControls = [];
+  var oMatrixDisplay = new sap.m.FormattedText({
+    htmlText: '<p style="color:#aaa;text-align:center;padding:8px">Select quantities above to calculate</p>'
+  }).addStyleClass('vtMatrixDisplay');
+
+  var _matrixData = {
+    OPERATOR: {
+      'Walk':          [['Average time per foot (w/ or w/o part)',0.3],['Avg time per foot with Hoist',0.4],['Long distance avg walk time per foot',0.2]],
+      'Obtain':        [['Very Small part',0.7],['Each additional Very Small part',0.2],['Small part',0.9],['Medium part',1.9],['Large part',2.9],['Very Large part w/ Manual Hoist',8.2]],
+      'Precise Load':  [['Very Small part',1.1],['Small part',1.1],['Medium part',2.0],['Large part',2.7],['Very Large part with Hoist',2.1],['Disengage & Dispose of Hoist',2.2]],
+      'Reposition':    [['Small part',2.8],['Medium part',2.8],['Large part',5.3]],
+      'Unload':        [['Very Small, Small or Medium part',1.7],['Large part',2.6]],
+      'Dispose/Place': [['Very Small or Small part',0.5],['Medium part',1.0],['Large part',1.8]],
+      'Buttons':       [['Press Palm Buttons',0.6],['Press Foot Pedal',0.4],['Turn Selector Knob',1.2],['Press Keypad Button',0.5]],
+      'Tooling':       [['Close Manual Fixture Clamp',1.4],['Open Manual Fixture Clamp',2.3],['Apply Manual Hand Clamp',3.8],['Remove Manual Hand Clamp',3.1],['Obtain Portable Fixture and Position',4.2],['Turn or Insert Detail Locking Pin',1.2],['Pull or Remove Detail Locking Pin',1.9],['Remove & Dispose Portable Fixture',3.1]],
+      'Fasteners':     [['Handstart Nut, Screw or Bolt',3.0],['Obtain Power Tool',1.5],['Load Screw or Bolt to Power Tool',1.2],['Position Power Tool',0.8],['Secure Screw or Bolt with Power Tool',2.5],['Release Power Tool',0.5]],
+      'Sealer/Mastic': [['Obtain and Position Manual Dispense Gun',2.5],['Apply Manual Flow Sealer (per mm)',0.006],['Apply Manual Daub Mastic (per daub)',1.4],['Minor reposition of Gun (<4")',1.2],['Major reposition of Gun (>4")',1.8],['Release Gun',0.5]],
+      'Spot Welding':  [['Obtain Large Spot Weld Gun',3.0],['Position Gun to First Location',2.5],['Heavy Gauge Spot Weld',2.2],['Average Reposition (<24")',2.0],['Major Reposition (>24")',3.0],['Release Weld Gun (return to Hook)',2.5]],
+      'Stud Welding':  [['Obtain Stud Weld Gun',1.5],['Position & Weld Stud',1.8],['Release Gun',0.5]]
+    },
+    MACHINE: {
+      'Fixture':   [['Clamps Open or Close',1.0],['Shot Pins Extend or Retract',1.0],['Slide Indexes',1.0],['Dump/Pivot Unit In or Out',1.5],['Turntable Rotates',4.0],['Trunnion Major Axis Rotate',4.0],['Trunnion Minor Axis Rotate',3.0]],
+      'Hard Guns': [['Gun Tips Close or Open',0.5],['Cycle Single Spot Weld',1.5]],
+      'Transfer':  [['Index Forward or Return (<8\' Travel)',4.0],['Lifter Up or Down (<18" Stroke)',2.0]]
+    },
+    ROBOT: {
+      'Spot Weld':       [['Moves in to Weld',1.5],['Cycle Single Spot Weld & move',3.0],['Robot Major Reposition',2.0],['Moves Out & Clear',1.5],['Return to Home',2.0],['Perform Tip Dress',6.0]],
+      'Mig Weld':        [['Moves in to Weld',1.5],['Torch Arc On or Off',0.9],['Linear Weld Speed (per mm)',0.067],['Robot Minor Reposition',0.5],['Robot Major Reposition',1.0],['Moves Out & Clear',1.5],['Perform Torch Ream',6.0]],
+      'Mat\'l Handling': [['Rotate to Location (<180°)',3.0],['Rotate to Location (>180°)',4.0],['Moves Out & Clear',1.5],['Pickup or Dropoff Additional Item',3.5],['Rotate to Home or Pounce',2.0]],
+      'Misc.':           [['Articulate through Sealer/Mastic (per mm)',0.003],['Apply Mastic Daub & Move (per location)',2.8],['Cycle Single Clinch Nut & Move',4.5],['Cycle Single Projection Weld & Move',4.5],['Apply Date Stamp',2.0]]
+    }
+  };
+
+  var _buildMatrixGroup = function (groupTitle, groupData) {
+    var groupVBox = new sap.m.VBox({ width: '100%' });
+    Object.keys(groupData).forEach(function (catName) {
+      var defs = groupData[catName];
+      var numCtrl = new sap.m.StepInput({ value: 1, min: 0, max: 99, step: 1, width: '62px', change: function () { _updateMatrixResult(); } });
+      var catObj  = { groupTitle: groupTitle, catName: catName, numCtrl: numCtrl, items: [] };
+      var itemsVBox = new sap.m.VBox({});
+      defs.forEach(function (def) {
+        var qtyCtrl = new sap.m.StepInput({ value: 0, min: 0, max: 200, step: 1, width: '62px', change: function () { _updateMatrixResult(); } });
+        catObj.items.push({ text: def[0], time: def[1], qtyCtrl: qtyCtrl });
+        itemsVBox.addItem(new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare',
+          items: [
+            new sap.m.Text({ text: def[0], wrapping: true }).addStyleClass('vtMxItemText'),
+            new sap.m.Text({ text: def[1]+'s', textAlign: 'End' }).addStyleClass('vtMxTimeText'),
+            qtyCtrl
+          ]
+        }).addStyleClass('vtMxItemRow'));
+      });
+      groupVBox.addItem(new sap.m.Panel({
+        expandable: true, expanded: false,
+        headerToolbar: new sap.m.Toolbar({ style: 'Clear', content: [
+          new sap.m.Text({ text: catName }), new sap.m.ToolbarSpacer(),
+          new sap.m.Label({ text: '×' }), numCtrl
+        ]}),
+        content: [ itemsVBox ]
+      }));
+      _matrixCatControls.push(catObj);
+    });
+    return groupVBox;
+  };
+
+  var _updateMatrixResult = function () {
+    var sum = 0, parts = [];
+    _matrixCatControls.forEach(function (cat) {
+      var num = +cat.numCtrl.getValue()||0;
+      cat.items.forEach(function (it) {
+        var qty = +it.qtyCtrl.getValue()||0;
+        if (qty > 0 && num > 0) { sum += num*qty*it.time; parts.push(num+'×'+qty+'×'+it.text+'('+it.time+'s)'); }
+      });
+    });
+    if (!parts.length) {
+      oMatrixDisplay.setHtmlText('<p style="color:#aaa;text-align:center;padding:8px">Select quantities above to calculate</p>');
+      _calcResults.matrix = ''; return;
+    }
+    var result  = Math.round(sum*100)/100;
+    var summary = parts.slice(0,4).join(' + ')+(parts.length>4?' + …':'');
+    _calcResults.matrix = summary+' = '+result;
+    oMatrixDisplay.setHtmlText(
+      '<p style="font-size:11px;color:#555;padding:2px 4px">'+summary+'</p>'+
+      '<p style="text-align:center;font-size:15px;font-weight:bold;color:#0854a0;padding:2px">Cycle Time = '+result+' s</p>'
+    );
+  };
+
+  // ─ Tab bar ────────────────────────────────────────────────────────────────
+  var oCalcTabBar = new sap.m.IconTabBar({
+    stretchContentHeight: false,
+    items: [
+      new sap.m.IconTabFilter({ key: 'general', text: 'General Calculator',
+        content: [ new sap.m.VBox({ items: [ oCalcOpLabel, oCalcDisplay, oCalcBtnBox ] }).addStyleClass('vtCalcGenBox') ]
+      }),
+      new sap.m.IconTabFilter({ key: 'processing', text: 'Processing',
+        content: [ new sap.m.HBox({ renderType: 'Bare', items: [
+          new sap.m.VBox({ renderType: 'Bare', items: [
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Process type:',          width: '150px' }), _procPType  ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Start pause tps (s):',   width: '150px' }), _procTps    ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'End pause tpe (s):',     width: '150px' }), _procTpe    ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Speed v (mm/s):',        width: '150px' }), _procV      ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Pre-travel tpre (s):',   width: '150px' }), _procTpre   ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Inter-travel tint (s):', width: '150px' }), _procTint   ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Post-travel tpost (s):', width: '150px' }), _procTpost  ] }),
+            new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Num. of processes:',     width: '150px' }), _procN      ] }),
+            oCalcProcLengthsBox
+          ] }).addStyleClass('vtDialogForm'),
+          new sap.m.VBox({ width: '100%', items: [ oCalcProcFormula ] }).addStyleClass('vtProcFormulaBox')
+        ] }) ]
+      }),
+      new sap.m.IconTabFilter({ key: 'travel', text: 'Travel',
+        content: [ new sap.m.VBox({ renderType: 'Bare', items: [
+          new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Distance (mm):', width: '160px' }), oCalcDistInput    ] }),
+          new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Speed (mm/s):',  width: '160px' }), oCalcSpeedInput   ] }),
+          new sap.m.HBox({ alignItems: 'Center', renderType: 'Bare', items: [ new sap.m.Label({ text: 'Travel Time:',   width: '160px' }), oCalcTravelResult ] })
+        ] }).addStyleClass('vtDialogForm') ]
+      }),
+      new sap.m.IconTabFilter({ key: 'matrix', text: 'Matrix',
+        content: [ new sap.m.VBox({ items: [
+          oMatrixDisplay,
+          new sap.m.HBox({ height: '340px', items: [
+            new sap.m.ScrollContainer({ height: '340px', vertical: true, width: '34%', content: [ _buildMatrixGroup('OPERATOR', _matrixData.OPERATOR) ] }),
+            new sap.m.ScrollContainer({ height: '340px', vertical: true, width: '33%', content: [ _buildMatrixGroup('MACHINE',  _matrixData.MACHINE)  ] }),
+            new sap.m.ScrollContainer({ height: '340px', vertical: true, width: '33%', content: [ _buildMatrixGroup('ROBOT',    _matrixData.ROBOT)    ] })
+          ] })
+        ] }) ]
+      })
+    ]
+  });
+
+  // ─ Open / Save ────────────────────────────────────────────────────────────
+  function openCycleCalcDialog() {
+    _calcResults = { general: '', processing: '', travel: '', matrix: '' };
+    var item = getCurrentItem();
+    if (item) {
+      var rc = parseRC(item.run_cond_config);
+      if (rc.cycle && rc.cycle.condition === RC_COND.CYCLE_CALC && rc.cycle.values.length) {
+        oCalcOpLabel.setText(rc.cycle.values[0]);
+        _calcResults.general = rc.cycle.values[0];
+      }
+    }
+    _rebuildProcLengths();
+    _updateProcResult();
+    _updateTravelResult();
+    _updateMatrixResult();
+    oCycleCalcDialog.open();
+  }
+
+  function _saveCycleCalc() {
+    var formula = _calcResults[oCalcTabBar.getSelectedKey()] || '';
+    if (!formula) { sap.m.MessageToast.show('Perform a calculation first'); return; }
+    oCycleCalcDialog.close();
+    applyRcChange('cycle', RC_COND.CYCLE_CALC, [formula], 0);
+    var num = parseFloat(formula.split('=').pop().trim());
+    if (!isNaN(num)) oRcCycleValueInput.setValue(num).setEnabled(false);
+  }
+
+  var oCycleCalcDialog = new sap.m.Dialog({
+    title: 'Cycle Time Calculator',
+    contentWidth: '720px', contentHeight: '540px',
+    draggable: true, resizable: true,
+    content: [ oCalcTabBar ],
+    beginButton: new sap.m.Button({ text: 'Save', type: 'Emphasized', press: function () { _saveCycleCalc(); } }),
+    endButton:   new sap.m.Button({ text: 'Cancel', press: function () {
+      oCycleCalcDialog.close();
+      var item = getCurrentItem(); if (item) refreshRcToolbar(item);
+    }})
+  });
+
   // ── Cycle Phase ───────────────────────────────────────────────────────────
   var oRcCycleSelect = new sap.m.Select({
     width: '100%',
     items: [
       new sap.ui.core.Item({ key: '',                    text: '—' }),
       new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE, text: 'Custom value' }),
-      new sap.ui.core.Item({ key: RC_COND.EQUAL_TO,     text: 'Equal to' })
+      new sap.ui.core.Item({ key: RC_COND.EQUAL_TO,     text: 'Equal to' }),
+      new sap.ui.core.Item({ key: 'Cycle Time Cal',    text: 'Cycle Time Calculator' })
     ],
     change: function (oEvent) { onCycleConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
   });
