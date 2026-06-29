@@ -271,10 +271,12 @@ def build_tree(records):
 JOB_METADATA = {
     "job_number": "", "job_title": "", "job_description": "",
     "target_cycle_time": 60,
-    "machine_list": [], "robot_list": [], "operator_list": []
+    "machine_list": [], "robot_list": [], "operator_list": [],
+    "predefined_processes": []
 }
-OP_METADATA = {}   # op_number → { op_title, op_description, num_of_parts }
-OP_NUMBERS  = set()  # op numbers created via API but not yet in SAMPLE_DATA
+OP_METADATA   = {}  # op_number → { op_title, op_description, num_of_parts }
+OP_NUMBERS    = set()  # op numbers created via API but not yet in SAMPLE_DATA
+ITEMS_DETAILS = {}  # op_number → list of station stat dicts
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -311,6 +313,51 @@ def api_update_db():
             "num_of_parts":   job_meta.get("num_of_parts", 1),
         }
         OP_NUMBERS.add(op_number)
+
+    # Persist project_metadata (includes machine_list, robot_list, operator_list)
+    proj_meta = data.get("project_metadata")
+    if proj_meta:
+        JOB_METADATA.update(proj_meta)   # always keep in-memory copy current
+        if DB_PATH and os.path.exists(DB_PATH):
+            proj_no = str(proj_meta.get("project_no") or "default")
+            conn = sqlite3.connect(DB_PATH)
+            _ensure_project_metadata_table(conn)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE project_metadata SET "
+                "project_title=?, project_description=?, target_cycle_time=?, "
+                "machine_list=?, robot_list=?, operator_list=?, predefined_processes=? "
+                "WHERE project_no=?",
+                (
+                    proj_meta.get("project_title", ""),
+                    proj_meta.get("project_description", ""),
+                    proj_meta.get("target_cycle_time", 60.0),
+                    proj_meta.get("machine_list", ""),
+                    proj_meta.get("robot_list", ""),
+                    proj_meta.get("operator_list", ""),
+                    proj_meta.get("predefined_processes", "{}"),
+                    proj_no,
+                )
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO project_metadata "
+                    "(project_no, project_title, project_description, target_cycle_time, "
+                    "machine_list, robot_list, operator_list, predefined_processes) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        proj_no,
+                        proj_meta.get("project_title", ""),
+                        proj_meta.get("project_description", ""),
+                        proj_meta.get("target_cycle_time", 60.0),
+                        proj_meta.get("machine_list", ""),
+                        proj_meta.get("robot_list", ""),
+                        proj_meta.get("operator_list", ""),
+                        proj_meta.get("predefined_processes", "{}"),
+                    )
+                )
+            conn.commit()
+            conn.close()
 
     # Flatten nested tree → flat list of DB records
     flat = []
@@ -362,12 +409,57 @@ def api_update_op_numbers():
 
 @app.route("/updateTree", methods=["POST"])
 def api_update_tree():
-    data = request.get_json() or {}
-    op   = data.get("op_number", "")
-    records  = get_records(op)
-    tree     = build_tree(records)
-    max_end  = max((r.get("cycle_end") or 0.0 for r in records), default=0.0)
-    return jsonify({"data": tree, "maxCycleEnd": max_end})
+    data    = request.get_json() or {}
+    op      = data.get("op_number", "")
+    records = get_records(op)
+    tree    = build_tree(records)
+    max_end = max((r.get("cycle_end") or 0.0 for r in records), default=0.0)
+
+    # items_details for this op
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        _ensure_items_details_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM items_details WHERE op_number = ?", (op,))
+        items_details = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+        conn.close()
+    else:
+        items_details = list(ITEMS_DETAILS.get(op, []))
+
+    # op metadata row (client reads op_number, op_title, job_description, num_of_parts)
+    op_meta = OP_METADATA.get(op, {})
+    op_meta_rows = [{
+        "op_number":       op,
+        "op_title":        op_meta.get("op_title", ""),
+        "job_description": op_meta.get("op_description", ""),
+        "num_of_parts":    op_meta.get("num_of_parts", 1),
+    }] if op else []
+
+    # project_metadata: prefer DB row, fall back to in-memory JOB_METADATA
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        _ensure_project_metadata_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM project_metadata LIMIT 1")
+        proj_row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        project_meta_rows = [dict(proj_row)] if proj_row else [JOB_METADATA]
+    else:
+        project_meta_rows = [JOB_METADATA]
+
+    return jsonify({
+        "data": {
+            "cycle_general_structure": tree,
+            "items_details":           items_details,
+            "op_metadata":             op_meta_rows,
+            "project_metadata":        project_meta_rows,
+        },
+        "maxCycleEnd": max_end,
+    })
 
 
 @app.route("/api/job_metadata", methods=["GET"])
@@ -513,6 +605,119 @@ def api_duplicate_op():
     src_meta = OP_METADATA.get(source_op, {})
     OP_METADATA[new_op] = dict(src_meta)
     return jsonify({"status": "success", "op_number": new_op})
+
+
+_PROJECT_METADATA_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS project_metadata (
+        project_no           TEXT PRIMARY KEY,
+        project_title        TEXT DEFAULT '',
+        project_description  TEXT DEFAULT '',
+        target_cycle_time    REAL DEFAULT 60.0,
+        machine_list         TEXT DEFAULT '',
+        robot_list           TEXT DEFAULT '',
+        operator_list        TEXT DEFAULT '',
+        predefined_processes TEXT DEFAULT '{}'
+    )
+"""
+
+_ITEMS_DETAILS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS items_details (
+        item_id                   TEXT PRIMARY KEY,
+        op_number                 TEXT,
+        designer_comments         TEXT,
+        designer_resources_links  TEXT,
+        designer_picture_links    TEXT,
+        machine_cycle_time_summary TEXT,
+        total_machine_cycle        REAL DEFAULT 0.0,
+        total_manual_cycle         REAL DEFAULT 0.0,
+        total_robot_cycle          REAL DEFAULT 0.0,
+        total_operator_cycle       REAL DEFAULT 0.0,
+        used_cycle_time            REAL DEFAULT 0.0,
+        num_of_parts               INTEGER DEFAULT 1
+    )
+"""
+
+
+def _ensure_project_metadata_table(conn):
+    conn.execute(_PROJECT_METADATA_SCHEMA)
+
+
+def _ensure_items_details_table(conn):
+    conn.execute(_ITEMS_DETAILS_SCHEMA)
+
+
+@app.route("/api/items_details/<op_number>", methods=["GET"])
+def api_get_items_details(op_number):
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        _ensure_items_details_table(conn)
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM items_details WHERE op_number = ?", (op_number,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+        conn.close()
+        return jsonify(rows)
+    return jsonify(ITEMS_DETAILS.get(op_number, []))
+
+
+@app.route("/api/items_details", methods=["POST"])
+def api_save_items_details():
+    data      = request.get_json() or {}
+    op_number = data.get("op_number", "")
+    records   = data.get("records", [])
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        _ensure_items_details_table(conn)
+        cur  = conn.cursor()
+        for rec in records:
+            item_id = rec.get("item_id")
+            if not item_id:
+                continue
+            cur.execute(
+                "UPDATE items_details SET "
+                "op_number=?, machine_cycle_time_summary=?, "
+                "total_machine_cycle=?, total_manual_cycle=?, "
+                "total_robot_cycle=?, total_operator_cycle=?, "
+                "used_cycle_time=?, num_of_parts=? "
+                "WHERE item_id=?",
+                (
+                    op_number,
+                    rec.get("machine_cycle_time_summary", "{}"),
+                    rec.get("total_machine_cycle", 0.0),
+                    rec.get("total_manual_cycle",  0.0),
+                    rec.get("total_robot_cycle",   0.0),
+                    rec.get("total_operator_cycle",0.0),
+                    rec.get("used_cycle_time",     0.0),
+                    rec.get("num_of_parts",        1),
+                    item_id,
+                )
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO items_details "
+                    "(item_id, op_number, machine_cycle_time_summary, "
+                    "total_machine_cycle, total_manual_cycle, total_robot_cycle, "
+                    "total_operator_cycle, used_cycle_time, num_of_parts) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        item_id, op_number,
+                        rec.get("machine_cycle_time_summary", "{}"),
+                        rec.get("total_machine_cycle", 0.0),
+                        rec.get("total_manual_cycle",  0.0),
+                        rec.get("total_robot_cycle",   0.0),
+                        rec.get("total_operator_cycle",0.0),
+                        rec.get("used_cycle_time",     0.0),
+                        rec.get("num_of_parts",        1),
+                    )
+                )
+        conn.commit()
+        conn.close()
+    else:
+        ITEMS_DETAILS[op_number] = records
+
+    return jsonify({"status": "success", "saved": len(records)})
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
     data-sap-ui-compatVersion="edge"
     data-sap-ui-async="true">
   </script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
 
@@ -89,6 +90,14 @@
     .vtMxItemRow > .vtMxItemText { flex: 1 1 0 !important; min-width: 0 !important; font-size: 0.78rem !important; padding-right: 4px !important; }
     .vtMxItemRow > .vtMxTimeText { font-size: 0.78rem !important; color: #888 !important; width: 44px !important; flex-shrink: 0 !important; text-align: right !important; }
 
+    /* Plots tab */
+    .vtPlotsTabBtn { cursor:pointer; padding:4px 14px; border:1px solid #c8c8c8; border-radius:12px; font-size:0.8rem; color:#555; background:#f7f7f7; font-family:72,Arial,sans-serif; }
+    .vtPlotsTabBtn.vtPActive { background:#09528A; color:#fff; border-color:#09528A; }
+    .vtStTabBtn { cursor:pointer; padding:3px 10px; border:1px solid #c8c8c8; border-radius:10px; font-size:0.78rem; color:#555; background:#f7f7f7; font-family:72,Arial,sans-serif; }
+    .vtStTabBtn.vtPActive { background:#09528A; color:#fff; border-color:#09528A; }
+    .vtPlotCard { background:#fff; border:1px solid #e4e4e4; border-radius:6px; margin:6px 0; padding:10px 14px; }
+    .vtPlotTitle { font-size:0.8rem; font-weight:600; color:#32363a; margin-bottom:6px; text-align:center; font-family:72,Arial,sans-serif; }
+
   </style>
 </head>
 <body class="sapUiBody">
@@ -111,10 +120,12 @@ sap.ui.getCore().attachInit(function () {
   var _jobState = {
     job_number: "", job_title: "", job_description: "",
     target_cycle_time: 60,
-    machine_list: [], robot_list: [], operator_list: []
+    machine_list: [], robot_list: [], operator_list: [],
+    predefined_processes: []
   };
   var _opMetaMap  = {};  // opNumber → { op_title, op_description, num_of_parts }
-  var _opTreeCache = {}; // opNumber → deep copy of tree items
+  var _opTreeCache      = {}; // opNumber → deep copy of tree items
+  var _itemsDetailsCache = {}; // opNumber → array of station stat rows (from items_details table)
 
   var clipboard = { items: [], mode: 'copy' };
 
@@ -169,7 +180,8 @@ sap.ui.getCore().attachInit(function () {
     SEQUENTIAL:      'Sequential',
     SYNC_START:      'Sync Start',
     SYNC_COMPLETION: 'Sync Completion',
-    CYCLE_CALC:      'Cycle Time Cal'
+    CYCLE_CALC:      'Cycle Time Cal',
+    PREDEFINED:      'Predefined'
   };
 
   // ── RC parse / serialize ───────────────────────────────────────────────────
@@ -303,6 +315,11 @@ sap.ui.getCore().attachInit(function () {
     } else if (cond === RC_COND.CYCLE_CALC) {
       var v = parseFloat((vals[0] || '').split('=').pop().trim());
       if (!isNaN(v)) item.cycle_time = r2(v);
+
+    } else if (cond === RC_COND.PREDEFINED) {
+      var pname = vals[0] || '';
+      var foundPD = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pname; })[0];
+      if (foundPD) item.cycle_time = r2(parseFloat(foundPD.cycle_time) || 0);
 
     } else if (cond === RC_COND.SUBPROCESS) {
       var children = item.sub_process_items || [];
@@ -860,12 +877,18 @@ sap.ui.getCore().attachInit(function () {
     var ck = cA && rc.cycle ? rc.cycle.condition : '';
     var cycleIsCustom = ck === RC_COND.CUSTOM_VALUE;
     var cycleIsCalc   = ck === RC_COND.CYCLE_CALC;
+    var cycleIsPredef = ck === RC_COND.PREDEFINED;
     oRcCycleValueInput.setEnabled(cA && cycleIsCustom);
     if (cycleIsCustom && rc.cycle && rc.cycle.values.length)
       oRcCycleValueInput.setValue(parseFloat(rc.cycle.values[0]) || 0);
     if (cycleIsCalc && rc.cycle && rc.cycle.values.length) {
       var calcNum = parseFloat((rc.cycle.values[0] || '').split('=').pop().trim());
       if (!isNaN(calcNum)) oRcCycleValueInput.setValue(calcNum);
+    }
+    if (cycleIsPredef && rc.cycle && rc.cycle.values.length) {
+      var pdName   = rc.cycle.values[0];
+      var pdFound  = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pdName; })[0];
+      if (pdFound) oRcCycleValueInput.setValue(parseFloat(pdFound.cycle_time) || 0);
     }
 
     var ek = eA && rc.end ? rc.end.condition : '';
@@ -908,6 +931,17 @@ sap.ui.getCore().attachInit(function () {
       case RC_COND.CUSTOM_VALUE: /* user types in Value field */                                                 break;
       case RC_COND.EQUAL_TO:     enterRcWait('cycle', RC_COND.EQUAL_TO, 'click a process for Equal Cycle Time'); break;
       case RC_COND.CYCLE_CALC:   openCycleCalcDialog();                                                          break;
+      case RC_COND.PREDEFINED:
+        var procs = _jobState.predefined_processes || [];
+        if (!procs.length) {
+          sap.m.MessageToast.show('No predefined processes. Add them in Job Spec → Predefined Processes.');
+          applyRcChange('cycle', null, [], 0);
+          oRcCycleSelect.setSelectedKey('');
+          return;
+        }
+        oPredefSelectModel.setData(procs);
+        oPredefSelectDialog.open();
+        break;
     }
   }
 
@@ -1358,43 +1392,75 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function _buildJobMetadata(op, items) {
-    var meta         = _opMetaMap[op] || {};
-    var stationList  = (items || []).map(function (item) { return item.item_id; }).join(",");
+    var meta          = _opMetaMap[op] || {};
+    var stationList   = (items || []).map(function (item) { return item.item_id; }).join(",");
     var usedCycleTime = getMaxCycleEnd(items);
+    var sums          = _computeCycleTypeSums(items);
     return {
       op_number:                  op,
       op_title:                   meta.op_title       || null,
       job_description:            meta.op_description || null,
       job_pictures:               null,
       station_list:               stationList,
-      machine_cycle_time_summary: "{}",
-      total_machine_cycle:        0.0,
-      total_manual_cycle:         0.0,
-      total_robot_cycle:          0.0,
-      total_operator_cycle:       0.0,
+      machine_cycle_time_summary: JSON.stringify(sums),
+      total_machine_cycle:        Math.round(sums.Machine  * 100) / 100,
+      total_manual_cycle:         Math.round(sums.Manual   * 100) / 100,
+      total_robot_cycle:          Math.round(sums.Robot    * 100) / 100,
+      total_operator_cycle:       Math.round(sums.Operator * 100) / 100,
       used_cycle_time:            usedCycleTime,
       num_of_parts:               meta.num_of_parts   || 1
+    };
+  }
+
+  function _buildProjectMetadata() {
+    var predefDict = {};
+    (_jobState.predefined_processes || []).forEach(function (p) {
+      if ((p.name || '').trim()) {
+        predefDict[p.name] = {
+          'Cycle Time Type': p.type       || 'Custom',
+          'Process Details': p.details    || '',
+          'Cycle Time (s)':  p.cycle_time || ''
+        };
+      }
+    });
+    var joinList = function (a) { return Array.isArray(a) ? a.filter(Boolean).join(',') : (a || ''); };
+    return {
+      project_no:          _jobState.job_number        || '',
+      project_title:       _jobState.job_title         || '',
+      project_description: _jobState.job_description   || '',
+      target_cycle_time:   _jobState.target_cycle_time || 0,
+      machine_list:        joinList(_jobState.machine_list),
+      robot_list:          joinList(_jobState.robot_list),
+      operator_list:       joinList(_jobState.operator_list),
+      predefined_processes: JSON.stringify(predefDict)
     };
   }
 
   function saveToDb() {
     var items   = oDataModel.getProperty("/items");
     var op      = oOpSelect.getSelectedKey();
+    var projMeta = _buildProjectMetadata();
     var payload = {
       cycle_general_structure: stripClientFields(items),
       job_metadata:            _buildJobMetadata(op, items),
+      project_metadata:        projMeta,
       op_number:               op,
       ops_to_delete:           _opsToDelete.slice()
     };
-    console.log("[ValiantTMS] POST /updateDB  op:", op, " items:", items.length, " ops_to_delete:", _opsToDelete);
+    console.log("[ValiantTMS] POST /updateDB payload:", JSON.stringify(payload, null, 2));
 
     fetch(API_BASE + "/updateDB", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify(payload)
     })
-      .then(function (r) { console.log("[ValiantTMS] /updateDB:", r.status); })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { console.error("[ValiantTMS] /updateDB error " + r.status + ":", t); });
+        console.log("[ValiantTMS] /updateDB:", r.status);
+      })
       .catch(function (err) { console.warn("[ValiantTMS] /updateDB response error:", err.message); });
+
+    saveItemsDetails(op);
 
     _opsToDelete = [];
     sap.m.MessageToast.show("Saved");
@@ -1840,6 +1906,12 @@ sap.ui.getCore().attachInit(function () {
                 if (cond === RC_COND.CYCLE_CALC) {
                   return '<span style="color:' + T + '"><em>' + valStr + '</em></span>';
                 }
+                if (cond === RC_COND.PREDEFINED) {
+                  var pdNameD  = vals[0] || '';
+                  var pdFoundD = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pdNameD; })[0];
+                  if (!pdFoundD) return '<span style="color:red"><strong>Predefined</strong>: <em>' + pdNameD + ' (not found)</em></span>';
+                  return '<span style="color:' + T + '"><strong>Predefined</strong>: <em>' + pdNameD + '</em></span>';
+                }
                 return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
               }
 
@@ -1882,6 +1954,40 @@ sap.ui.getCore().attachInit(function () {
     oRulerHtml.setContent(buildRulerHtml(scaleFactor, maxCycleEnd));
   }
 
+  // ── Project metadata helpers ──────────────────────────────────────────────
+  function _splitList(s) {
+    if (!s) return [];
+    try { var a = JSON.parse(s); if (Array.isArray(a)) return a; } catch (e) {}
+    return s.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+
+  function _parsePredef(s) {
+    try {
+      var d = JSON.parse(s || '{}');
+      return Object.keys(d).map(function (name) {
+        var v = d[name] || {};
+        return {
+          name:       name,
+          type:       (v['Cycle Time Type'] === 'Cycle Time Calculator' || v['Cycle Time Type'] === RC_COND.CYCLE_CALC) ? RC_COND.CYCLE_CALC : 'Custom',
+          details:    v['Process Details'] || '',
+          cycle_time: v['Cycle Time (s)']  || ''
+        };
+      });
+    } catch (e) { return []; }
+  }
+
+  function _applyProjectMeta(projectMeta) {
+    if (!projectMeta) return;
+    if (projectMeta.project_no)         _jobState.job_number           = projectMeta.project_no;
+    if (projectMeta.project_title)      _jobState.job_title            = projectMeta.project_title;
+    if (projectMeta.project_description)_jobState.job_description      = projectMeta.project_description;
+    if (projectMeta.target_cycle_time)  _jobState.target_cycle_time    = projectMeta.target_cycle_time;
+    _jobState.machine_list         = _splitList(projectMeta.machine_list);
+    _jobState.robot_list           = _splitList(projectMeta.robot_list);
+    _jobState.operator_list        = _splitList(projectMeta.operator_list);
+    _jobState.predefined_processes = _parsePredef(projectMeta.predefined_processes);
+  }
+
   // ── API calls ─────────────────────────────────────────────────────────────
   function loadTree(opNumber) {
     nAutoExpandLevel = 2;
@@ -1895,7 +2001,31 @@ sap.ui.getCore().attachInit(function () {
         return r.json();
       })
       .then(function (response) {
-        var items = response.data || [];
+        var responseData    = response.data || {};
+        var items           = (responseData.cycle_general_structure) || responseData || [];
+        var opMetaRows      = responseData.op_metadata      || [];
+        var projectMetaRows = responseData.project_metadata || [];
+        var itemsDetailRows = responseData.items_details    || [];
+
+        opMetaRows.forEach(function (row) {
+          if (row.op_number) {
+            _opMetaMap[row.op_number] = {
+              op_title:       row.op_title        || '',
+              op_description: row.job_description || '',
+              num_of_parts:   row.num_of_parts    || 1
+            };
+          }
+        });
+
+        // Cache items_details rows keyed by item_id for fast lookup
+        if (itemsDetailRows.length) {
+          _itemsDetailsCache[opNumber] = {};
+          itemsDetailRows.forEach(function (row) {
+            if (row.item_id) { _itemsDetailsCache[opNumber][row.item_id] = row; }
+          });
+        }
+
+        _applyProjectMeta(projectMetaRows[0] || null);
         annotateSteps(items, null);
         annotateAncestors(items, []);
         maxCycleEnd = getMaxCycleEnd(items) || 500;
@@ -1903,6 +2033,7 @@ sap.ui.getCore().attachInit(function () {
         oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
         updateGanttColumn();
         updateRuler();
+        if (oIconTabBar && oIconTabBar.getSelectedKey() === 'plots') { refreshPlots(opNumber); }
       })
       .catch(function (err) {
         sap.m.MessageToast.show("Error loading op data: " + err.message);
@@ -1918,6 +2049,7 @@ sap.ui.getCore().attachInit(function () {
     oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
     updateGanttColumn();
     updateRuler();
+    if (oIconTabBar && oIconTabBar.getSelectedKey() === 'plots') { refreshPlots(opNumber); }
   }
 
   function _cacheCurrentOp() {
@@ -2291,23 +2423,93 @@ sap.ui.getCore().attachInit(function () {
   var _robotPanel    = makeResourceListPanel("Robot List");
   var _operatorPanel = makeResourceListPanel("Manual Operations");
 
+  // ── Predefined Processes Model & Table ────────────────────────────────────
+  var _predefCalcTargetRow = null; // set to row index when calculator opens from predef tab
+
+  var oPredefModel = new sap.ui.model.json.JSONModel({ items: [] });
+
+  var oPredefTable = new sap.m.Table({
+    columns: [
+      new sap.m.Column({ header: new sap.m.Label({ text: 'Name' }),             width: '160px' }),
+      new sap.m.Column({ header: new sap.m.Label({ text: 'Type' }),             width: '145px' }),
+      new sap.m.Column({ header: new sap.m.Label({ text: 'Process Details' })                  }),
+      new sap.m.Column({ header: new sap.m.Label({ text: 'Cycle Time (s)' }),   width: '90px', hAlign: 'End' }),
+      new sap.m.Column({ width: '44px' })
+    ],
+    items: {
+      path: '/items',
+      template: new sap.m.ColumnListItem({
+        cells: [
+          new sap.m.Input({ value: '{name}', width: '100%', placeholder: 'Process name' }),
+          new sap.m.Select({
+            selectedKey: '{type}',
+            width: '140px',
+            items: [
+              new sap.ui.core.Item({ key: 'Custom',             text: 'Custom'           }),
+              new sap.ui.core.Item({ key: RC_COND.CYCLE_CALC,   text: 'Cycle Time Cal'   })
+            ],
+            change: function () {
+              var path = this.getBindingContext().getPath();
+              var idx  = parseInt(path.split('/').pop());
+              var key  = this.getSelectedKey();
+              if (key === RC_COND.CYCLE_CALC) {
+                _predefCalcTargetRow = idx;
+                openCycleCalcDialog();
+              } else {
+                oPredefModel.setProperty(path + '/details',    '');
+                oPredefModel.setProperty(path + '/cycle_time', '');
+              }
+            }
+          }),
+          new sap.m.Input({
+            value: '{details}', width: '100%', placeholder: 'Formula / description',
+            enabled: { path: 'type', formatter: function (t) { return t !== RC_COND.CYCLE_CALC; } }
+          }),
+          new sap.m.Input({
+            value: '{cycle_time}', width: '80px', placeholder: '0',
+            enabled: { path: 'type', formatter: function (t) { return t !== RC_COND.CYCLE_CALC; } }
+          }),
+          new sap.m.Button({
+            icon: 'sap-icon://delete', type: 'Transparent',
+            press: function () {
+              var path  = this.getBindingContext().getPath();
+              var idx   = parseInt(path.split('/').pop());
+              var items = oPredefModel.getProperty('/items').slice();
+              items.splice(idx, 1);
+              oPredefModel.setProperty('/items', items);
+            }
+          })
+        ]
+      })
+    }
+  }).setModel(oPredefModel);
+
   // ── Job Dialog ─────────────────────────────────────────────────────────────
   var oJobNumInput   = new sap.m.Input({ placeholder: "e.g. J100",   width: "200px" });
   var oJobTitleInput = new sap.m.Input({ placeholder: "Job title",   width: "100%" });
   var oJobDescInput  = new sap.m.TextArea({ placeholder: "Job description", width: "100%", rows: 4 });
 
-  function openJobDialog() {
+  function _fillAndOpenJobDialog() {
     oJobNumInput.setValue(_jobState.job_number).setValueState("None");
     oJobTitleInput.setValue(_jobState.job_title);
     oJobDescInput.setValue(_jobState.job_description);
     oTctDirectInput.setValue(_jobState.target_cycle_time || 60);
-    _machinePanel.setItems(_jobState.machine_list  || []);
-    _robotPanel.setItems(_jobState.robot_list      || []);
+    _machinePanel.setItems(_jobState.machine_list   || []);
+    _robotPanel.setItems(_jobState.robot_list       || []);
     _operatorPanel.setItems(_jobState.operator_list || []);
+    oPredefModel.setData({ items: JSON.parse(JSON.stringify(_jobState.predefined_processes || [])) });
     oJobDialog.open();
   }
 
+  function openJobDialog() {
+    _fillAndOpenJobDialog();
+  }
+
   function _saveJobDialog() {
+    // Capture predefined processes first — before any validation that might return early
+    _jobState.predefined_processes = (oPredefModel.getProperty('/items') || [])
+      .filter(function (p) { return (p.name || '').trim(); });
+
     var jobNum = oJobNumInput.getValue().trim();
     if (!jobNum) { oJobNumInput.setValueState("Error").setValueStateText("Job # is required"); return; }
     oJobNumInput.setValueState("None");
@@ -2322,6 +2524,7 @@ sap.ui.getCore().attachInit(function () {
     _jobState.robot_list        = _robotPanel.getItems();
     _jobState.operator_list     = _operatorPanel.getItems();
     oJobDialog.close();
+    recalcTree();
     sap.m.MessageToast.show("Job saved.");
   }
 
@@ -2353,6 +2556,24 @@ sap.ui.getCore().attachInit(function () {
           key: "resources", text: "Resources", icon: "sap-icon://group",
           content: [new sap.m.VBox({ items: [
             _machinePanel.panel, _robotPanel.panel, _operatorPanel.panel
+          ]})]
+        }),
+        new sap.m.IconTabFilter({
+          key: "predef", text: "Predefined Processes", icon: "sap-icon://bookmark",
+          content: [new sap.m.VBox({ items: [
+            new sap.m.Toolbar({ style: "Clear", content: [
+              new sap.m.Label({ text: "Saved processes reusable via the Cycle Phase dropdown." }),
+              new sap.m.ToolbarSpacer(),
+              new sap.m.Button({
+                icon: "sap-icon://add", text: "Add Row", type: "Transparent",
+                press: function () {
+                  var items = oPredefModel.getProperty('/items').slice();
+                  items.push({ name: '', type: 'Custom', details: '', cycle_time: '' });
+                  oPredefModel.setProperty('/items', items);
+                }
+              })
+            ]}),
+            new sap.m.ScrollContainer({ vertical: true, height: "320px", content: [ oPredefTable ] })
           ]})]
         })
       ]
@@ -2739,22 +2960,103 @@ sap.ui.getCore().attachInit(function () {
   function _saveCycleCalc() {
     var formula = _calcResults[oCalcTabBar.getSelectedKey()] || '';
     if (!formula) { sap.m.MessageToast.show('Perform a calculation first'); return; }
+
+    if (_predefCalcTargetRow !== null) {
+      var items = oPredefModel.getProperty('/items').slice();
+      if (items[_predefCalcTargetRow]) {
+        var numVal2 = parseFloat(formula.split('=').pop().trim());
+        items[_predefCalcTargetRow].details    = formula;
+        items[_predefCalcTargetRow].cycle_time = isNaN(numVal2) ? '' : String(numVal2);
+      }
+      oPredefModel.setProperty('/items', items);
+      _predefCalcTargetRow = null;
+      oCycleCalcDialog.close();
+      return;
+    }
+
     oCycleCalcDialog.close();
     applyRcChange('cycle', RC_COND.CYCLE_CALC, [formula], 0);
     var num = parseFloat(formula.split('=').pop().trim());
     if (!isNaN(num)) oRcCycleValueInput.setValue(num).setEnabled(false);
   }
 
+  var oSavePredefNameInput = new sap.m.Input({ placeholder: 'e.g. "Robot Weld Small Part"', width: '100%' });
+  var oSavePredefDialog = new sap.m.Dialog({
+    title: 'Save as Predefined Process',
+    contentWidth: '380px',
+    content: [
+      new sap.m.VBox({ items: [
+        new sap.m.Label({ text: 'Enter a name for this predefined process:' }),
+        oSavePredefNameInput
+      ] }).addStyleClass('sapUiSmallMargin')
+    ],
+    beginButton: new sap.m.Button({
+      text: 'Save', type: 'Emphasized',
+      press: function () {
+        var name = oSavePredefNameInput.getValue().trim();
+        if (!name) { sap.m.MessageToast.show('Name is required'); return; }
+        var tab     = oCalcTabBar.getSelectedKey();
+        var formula = _calcResults[tab] || '';
+        if (!formula) { sap.m.MessageToast.show('Perform a calculation first'); return; }
+        var numVal  = parseFloat(formula.split('=').pop().trim());
+        if (!_jobState.predefined_processes) _jobState.predefined_processes = [];
+        if (_jobState.predefined_processes.some(function (p) { return p.name === name; })) {
+          sap.m.MessageToast.show('A predefined process named "' + name + '" already exists');
+          return;
+        }
+        _jobState.predefined_processes.push({
+          name:       name,
+          type:       RC_COND.CYCLE_CALC,
+          details:    formula,
+          cycle_time: isNaN(numVal) ? '0' : String(numVal)
+        });
+        oSavePredefDialog.close();
+        sap.m.MessageToast.show('Saved as predefined: "' + name + '"');
+      }
+    }),
+    endButton: new sap.m.Button({ text: 'Cancel', press: function () { oSavePredefDialog.close(); } })
+  });
+
+  var oPredefSelectModel  = new sap.ui.model.json.JSONModel([]);
+  var oPredefSelectDialog = new sap.m.SelectDialog({
+    title:      'Select Predefined Process',
+    noDataText: 'No predefined processes. Add them in Job Spec → Predefined Processes.',
+    items: {
+      path: '/',
+      template: new sap.m.StandardListItem({
+        title:       '{name}',
+        description: '{details}',
+        info:        { path: 'cycle_time', formatter: function (v) { return v ? v + ' s' : ''; } }
+      })
+    },
+    confirm: function (oEvent) {
+      var selItem = oEvent.getParameter('selectedItem');
+      if (!selItem) return;
+      var pname   = selItem.getTitle();
+      applyRcChange('cycle', RC_COND.PREDEFINED, [pname], 0);
+      var pdRec = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pname; })[0];
+      if (pdRec) oRcCycleValueInput.setValue(parseFloat(pdRec.cycle_time) || 0).setEnabled(false);
+    },
+    cancel: function () {}
+  }).setModel(oPredefSelectModel);
+
   var oCycleCalcDialog = new sap.m.Dialog({
     title: 'Cycle Time Calculator',
     contentWidth: '720px', contentHeight: '540px',
     draggable: true, resizable: true,
     content: [ oCalcTabBar ],
-    beginButton: new sap.m.Button({ text: 'Save', type: 'Emphasized', press: function () { _saveCycleCalc(); } }),
-    endButton:   new sap.m.Button({ text: 'Cancel', press: function () {
-      oCycleCalcDialog.close();
-      var item = getCurrentItem(); if (item) refreshRcToolbar(item);
-    }})
+    buttons: [
+      new sap.m.Button({ text: 'Save', type: 'Emphasized', press: function () { _saveCycleCalc(); } }),
+      new sap.m.Button({
+        text: 'Save as Predefined', icon: 'sap-icon://bookmark',
+        press: function () { oSavePredefNameInput.setValue(''); oSavePredefDialog.open(); }
+      }),
+      new sap.m.Button({ text: 'Cancel', press: function () {
+        _predefCalcTargetRow = null;
+        oCycleCalcDialog.close();
+        var item = getCurrentItem(); if (item) refreshRcToolbar(item);
+      }})
+    ]
   });
 
   // ── Cycle Phase ───────────────────────────────────────────────────────────
@@ -2764,7 +3066,8 @@ sap.ui.getCore().attachInit(function () {
       new sap.ui.core.Item({ key: '',                    text: '—' }),
       new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE, text: 'Custom value' }),
       new sap.ui.core.Item({ key: RC_COND.EQUAL_TO,     text: 'Equal to' }),
-      new sap.ui.core.Item({ key: 'Cycle Time Cal',    text: 'Cycle Time Calculator' })
+      new sap.ui.core.Item({ key: RC_COND.CYCLE_CALC,  text: 'Cycle Time Calculator' }),
+      new sap.ui.core.Item({ key: RC_COND.PREDEFINED, text: 'Predefined'             })
     ],
     change: function (oEvent) { onCycleConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
   });
@@ -2977,6 +3280,281 @@ sap.ui.getCore().attachInit(function () {
     flexContent: oTable
   });
 
+  // ── Plots / Chart.js ──────────────────────────────────────────────────────
+  var _chartInstances = {};
+  var _plotsCurrentOp = null;
+
+  function _destroyChart(id) {
+    if (_chartInstances[id]) { _chartInstances[id].destroy(); delete _chartInstances[id]; }
+  }
+
+  function _computeCycleTypeSums(items) {
+    var sums = { Machine: 0.0, Manual: 0.0, Robot: 0.0, Operator: 0.0 };
+    function walk(list) {
+      (list || []).forEach(function (item) {
+        if (Object.prototype.hasOwnProperty.call(sums, item.cycle_type)) {
+          sums[item.cycle_type] += (item.cycle_time || 0);
+        }
+        walk(item.sub_process_items);
+      });
+    }
+    walk(items);
+    return sums;
+  }
+
+  function _renderPieChart(canvasId, usedTime, totalTarget, numOfParts) {
+    _destroyChart(canvasId);
+    var ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+    var remaining = totalTarget - usedTime;
+    var labels, data, colors;
+    if (remaining < 0) {
+      labels = ['Excess', 'Target Cycle Time'];
+      data   = [Math.round(Math.abs(remaining) * 100) / 100, Math.round(totalTarget * 100) / 100];
+      colors = ['#cc0000', '#dddddd'];
+    } else {
+      labels = ['Used [' + numOfParts + ']', 'Remaining'];
+      data   = [Math.round(usedTime * 100) / 100, Math.round(remaining * 100) / 100];
+      colors = ['#09528A', '#dddddd'];
+    }
+    _chartInstances[canvasId] = new Chart(ctx, {
+      type: 'pie',
+      data: {
+        labels: labels,
+        datasets: [{ data: data, backgroundColor: colors, borderWidth: 1, borderColor: '#fff' }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { font: { family: '72,Arial,sans-serif', size: 11 }, padding: 10 } },
+          tooltip: { callbacks: { label: function (c) { return c.label + ': ' + c.parsed + 's'; } } }
+        }
+      }
+    });
+  }
+
+  function _renderBarChart(canvasId, categories, values, limitValue) {
+    _destroyChart(canvasId);
+    var ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+    var datasets = [{
+      type: 'bar', data: values, backgroundColor: '#09528A',
+      borderRadius: 3, label: 'Time (s)'
+    }];
+    if (limitValue && limitValue > 0) {
+      datasets.push({
+        type: 'line',
+        data: categories.map(function () { return limitValue; }),
+        borderColor: '#cc0000', borderWidth: 1.5,
+        borderDash: [5, 4], pointRadius: 0, fill: false,
+        label: 'Target (' + limitValue + 's)', tension: 0
+      });
+    }
+    _chartInstances[canvasId] = new Chart(ctx, {
+      data: { labels: categories, datasets: datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: !!limitValue, labels: { font: { family: '72,Arial,sans-serif', size: 11 } } },
+          tooltip: { callbacks: { label: function (c) { return c.dataset.label + ': ' + c.parsed.y + 's'; } } }
+        },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: 'Time (s)', font: { family: '72,Arial,sans-serif', size: 10 } } },
+          x: { ticks: { font: { family: '72,Arial,sans-serif', size: 10 } } }
+        }
+      }
+    });
+  }
+
+  function _renderOpPlots(items, numOfParts, target) {
+    var opMaxEnd   = getMaxCycleEnd(items);
+    var totalTarget = target * numOfParts;
+    _renderPieChart('vtOpPieCanvas', opMaxEnd, totalTarget, numOfParts);
+    var sums   = _computeCycleTypeSums(items);
+    var ctCats = ['Machine', 'Manual', 'Robot', 'Operator'];
+    var ctVals = ctCats.map(function (k) { return Math.round(sums[k] * 100) / 100; });
+    _renderBarChart('vtOpCTCanvas',  ctCats, ctVals, target);
+    _renderBarChart('vtOpResCanvas', ctCats, ctVals, target);
+  }
+
+  function _renderStationCharts(station, stIdSafe, numOfParts, target) {
+    var pieId = 'vtSt_' + stIdSafe + '_pie';
+    var ctId  = 'vtSt_' + stIdSafe + '_ct';
+    var resId = 'vtSt_' + stIdSafe + '_res';
+    var used        = station.cycle_time || 0;
+    var totalTarget = target * numOfParts;
+    _renderPieChart(pieId, used, totalTarget, numOfParts);
+    var sums   = _computeCycleTypeSums(station.sub_process_items || []);
+    var ctCats = ['Machine', 'Manual', 'Robot', 'Operator'];
+    var ctVals = ctCats.map(function (k) { return Math.round(sums[k] * 100) / 100; });
+    _renderBarChart(ctId,  ctCats, ctVals, target);
+    _renderBarChart(resId, ctCats, ctVals, target);
+  }
+
+  function _renderStationPlots(items, numOfParts, target) {
+    var tabBar  = document.getElementById('vtStSubTabBar');
+    var content = document.getElementById('vtStContent');
+    if (!tabBar || !content) return;
+    Object.keys(_chartInstances).forEach(function (id) {
+      if (id.indexOf('vtSt_') === 0) { _destroyChart(id); }
+    });
+    tabBar.innerHTML  = '';
+    content.innerHTML = '';
+    var stations = items || [];
+    if (!stations.length) {
+      content.innerHTML = '<div style="padding:24px;color:#aaa;font-family:72,Arial,sans-serif;font-size:13px;">No stations found.</div>';
+      return;
+    }
+    stations.forEach(function (station, i) {
+      var stId     = station.item_id;
+      var stIdSafe = stId.replace(/[^a-zA-Z0-9]/g, '_');
+      var stLabel  = station.step || ('S' + (i + 1));
+      var btn = document.createElement('button');
+      btn.className = 'vtStTabBtn' + (i === 0 ? ' vtPActive' : '');
+      btn.textContent = stLabel;
+      btn.setAttribute('data-stid', stIdSafe);
+      btn.onclick = (function (safe) { return function () { vtSwitchStationTab(safe); }; })(stIdSafe);
+      tabBar.appendChild(btn);
+      var panel = document.createElement('div');
+      panel.id = 'vtStPanel_' + stIdSafe;
+      panel.style.display = i === 0 ? 'block' : 'none';
+      panel.innerHTML =
+        '<div class="vtPlotCard">' +
+          '<div class="vtPlotTitle">' + stLabel + ' Calculated Cycle Time Summary</div>' +
+          '<div style="position:relative;height:180px;"><canvas id="vtSt_' + stIdSafe + '_pie"></canvas></div>' +
+        '</div>' +
+        '<div class="vtPlotCard">' +
+          '<div class="vtPlotTitle">' + stLabel + ' Cycle Type</div>' +
+          '<div style="position:relative;height:180px;"><canvas id="vtSt_' + stIdSafe + '_ct"></canvas></div>' +
+        '</div>' +
+        '<div class="vtPlotCard">' +
+          '<div class="vtPlotTitle">' + stLabel + ' Resource Usage Summary</div>' +
+          '<div style="position:relative;height:180px;"><canvas id="vtSt_' + stIdSafe + '_res"></canvas></div>' +
+        '</div>';
+      content.appendChild(panel);
+      (function (st, safe, n, t) {
+        setTimeout(function () { _renderStationCharts(st, safe, n, t); }, 0);
+      })(station, stIdSafe, numOfParts, target);
+    });
+  }
+
+  function _renderJobPlots() {
+    var allOps    = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+    var cached    = allOps.filter(function (op) { return !!_opTreeCache[op]; });
+    var target    = _jobState.target_cycle_time || 0;
+    var noteEl    = document.getElementById('vtJobPlotsNote');
+    if (noteEl) {
+      noteEl.textContent = cached.length < allOps.length
+        ? 'Showing ' + cached.length + ' of ' + allOps.length + ' ops — select remaining ops in Design tab to load them.'
+        : 'All ' + allOps.length + ' op(s) loaded.';
+    }
+    var ctVals = cached.map(function (op) {
+      return Math.round(getMaxCycleEnd(_opTreeCache[op]) * 100) / 100;
+    });
+    _renderBarChart('vtJobCTSCanvas', cached, ctVals, target);
+    var totSums = { Machine: 0.0, Manual: 0.0, Robot: 0.0, Operator: 0.0 };
+    cached.forEach(function (op) {
+      var s = _computeCycleTypeSums(_opTreeCache[op]);
+      Object.keys(totSums).forEach(function (k) { totSums[k] += s[k]; });
+    });
+    var ctCats = ['Machine', 'Manual', 'Robot', 'Operator'];
+    var ctTotals = ctCats.map(function (k) { return Math.round(totSums[k] * 100) / 100; });
+    _renderBarChart('vtJobCTCanvas',  ctCats, ctTotals, target);
+    _renderBarChart('vtJobResCanvas', ctCats, ctTotals, target);
+  }
+
+  function refreshPlots(opNumber) {
+    if (!opNumber) return;
+    _plotsCurrentOp = opNumber;
+    var sel = document.getElementById('vtPlotsOpSelect');
+    if (sel && sel.value !== opNumber) { sel.value = opNumber; }
+    var items      = _opTreeCache[opNumber] || [];
+    var numOfParts = (_opMetaMap[opNumber] || {}).num_of_parts || 1;
+    var target     = _jobState.target_cycle_time || 0;
+    var active = 'station';
+    ['station', 'op', 'job'].forEach(function (t) {
+      var el = document.getElementById('vtPlotsPanel_' + t);
+      if (el && el.style.display !== 'none') { active = t; }
+    });
+    if (active === 'station')  { _renderStationPlots(items, numOfParts, target); }
+    else if (active === 'op')  { _renderOpPlots(items, numOfParts, target); }
+    else if (active === 'job') { _renderJobPlots(); }
+  }
+
+  function syncPlotsOpSelector() {
+    var sel = document.getElementById('vtPlotsOpSelect');
+    if (!sel) return;
+    sel.innerHTML = '';
+    oOpSelect.getItems().forEach(function (item) {
+      var opt = document.createElement('option');
+      opt.value = item.getKey();
+      opt.text  = item.getText();
+      sel.appendChild(opt);
+    });
+    var desired = _plotsCurrentOp || oOpSelect.getSelectedKey();
+    if (desired) { sel.value = desired; }
+  }
+
+  function saveItemsDetails(opNumber) {
+    var items      = _opTreeCache[opNumber] || oDataModel.getProperty('/items') || [];
+    var numOfParts = (_opMetaMap[opNumber] || {}).num_of_parts || 1;
+    var records    = items.map(function (station) {
+      var sums = _computeCycleTypeSums(station.sub_process_items || []);
+      return {
+        item_id:                station.item_id,
+        op_number:              opNumber,
+        total_machine_cycle:    Math.round(sums.Machine  * 100) / 100,
+        total_manual_cycle:     Math.round(sums.Manual   * 100) / 100,
+        total_robot_cycle:      Math.round(sums.Robot    * 100) / 100,
+        total_operator_cycle:   Math.round(sums.Operator * 100) / 100,
+        used_cycle_time:        Math.round((station.cycle_time / numOfParts) * 100) / 100,
+        num_of_parts:           numOfParts,
+        machine_cycle_time_summary: JSON.stringify(sums)
+      };
+    });
+    if (!records.length) return;
+    fetch(API_BASE + '/api/items_details', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ op_number: opNumber, records: records })
+    })
+      .then(function (r) { console.log('[ValiantTMS] items_details saved:', r.status); })
+      .catch(function (err) { console.warn('[ValiantTMS] items_details error:', err.message); });
+  }
+
+  window.vtSwitchPlotTab = function (tabName, btn) {
+    ['station', 'op', 'job'].forEach(function (t) {
+      var panel = document.getElementById('vtPlotsPanel_' + t);
+      if (panel) { panel.style.display = t === tabName ? 'flex' : 'none'; }
+    });
+    document.querySelectorAll('.vtPlotsTabBtn').forEach(function (b) { b.classList.remove('vtPActive'); });
+    if (btn) { btn.classList.add('vtPActive'); }
+    var op         = _plotsCurrentOp || oOpSelect.getSelectedKey();
+    var items      = _opTreeCache[op] || [];
+    var numOfParts = (_opMetaMap[op] || {}).num_of_parts || 1;
+    var target     = _jobState.target_cycle_time || 0;
+    if (tabName === 'station')  { _renderStationPlots(items, numOfParts, target); }
+    else if (tabName === 'op')  { _renderOpPlots(items, numOfParts, target); }
+    else if (tabName === 'job') { _renderJobPlots(); }
+  };
+
+  window.vtSwitchStationTab = function (stIdSafe) {
+    document.querySelectorAll('[id^="vtStPanel_"]').forEach(function (p) { p.style.display = 'none'; });
+    var panel = document.getElementById('vtStPanel_' + stIdSafe);
+    if (panel) { panel.style.display = 'block'; }
+    document.querySelectorAll('.vtStTabBtn').forEach(function (b) { b.classList.remove('vtPActive'); });
+    document.querySelectorAll('[data-stid="' + stIdSafe + '"]').forEach(function (b) { b.classList.add('vtPActive'); });
+  };
+
+  window.vtRefreshPlotsForOp = function (opNumber) {
+    if (!opNumber) return;
+    _plotsCurrentOp = opNumber;
+    if (_opTreeCache[opNumber]) { refreshPlots(opNumber); }
+    else { loadTree(opNumber); }
+  };
+
   // ── Tab Bar ───────────────────────────────────────────────────────────────
   var oIconTabBar = new sap.m.IconTabBar({
     expandable:           false,
@@ -2997,8 +3575,48 @@ sap.ui.getCore().attachInit(function () {
       new sap.m.IconTabFilter({
         key: "plots", text: "Plots",
         content: [new sap.ui.core.HTML({
-          content:         '<div style="padding:48px;color:#aaa;font-family:72,Arial,sans-serif;font-size:15px;">Plots — coming soon</div>',
-          sanitizeContent: false
+          sanitizeContent: false,
+          content: [
+            '<div id="vtPlotsRoot" style="height:calc(100vh - 110px);display:flex;flex-direction:column;background:#f5f5f5;">',
+
+              // Op selector bar
+              '<div style="padding:6px 10px;border-bottom:1px solid #e0e0e0;background:#fff;display:flex;align-items:center;gap:8px;flex-shrink:0;">',
+                '<span style="font-size:0.82rem;font-family:72,Arial,sans-serif;color:#32363a;font-weight:600;">Op:</span>',
+                '<select id="vtPlotsOpSelect" onchange="vtRefreshPlotsForOp(this.value)"',
+                  ' style="font-size:0.82rem;font-family:72,Arial,sans-serif;border:1px solid #c0c0c0;border-radius:3px;padding:3px 8px;background:#fff;color:#32363a;cursor:pointer;">',
+                '</select>',
+              '</div>',
+
+              // Sub-tab bar
+              '<div id="vtPlotsSubTabBar" style="padding:6px 10px;border-bottom:1px solid #e0e0e0;background:#fff;display:flex;gap:6px;flex-shrink:0;">',
+                '<button class="vtPlotsTabBtn vtPActive" onclick="vtSwitchPlotTab(\'station\',this)">Station Plots</button>',
+                '<button class="vtPlotsTabBtn" onclick="vtSwitchPlotTab(\'op\',this)">Op Plots</button>',
+                '<button class="vtPlotsTabBtn" onclick="vtSwitchPlotTab(\'job\',this)">Job Plots</button>',
+              '</div>',
+
+              // Station Plots panel
+              '<div id="vtPlotsPanel_station" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">',
+                '<div id="vtStSubTabBar" style="padding:4px 10px;border-bottom:1px solid #e0e0e0;background:#fafafa;display:flex;gap:4px;flex-wrap:wrap;flex-shrink:0;min-height:32px;align-items:center;"></div>',
+                '<div id="vtStContent" style="flex:1;overflow-y:auto;padding:8px;"></div>',
+              '</div>',
+
+              // Op Plots panel
+              '<div id="vtPlotsPanel_op" style="flex:1;overflow-y:auto;padding:8px;display:none;flex-direction:column;">',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Op Calculated Cycle Time Summary</div><div style="position:relative;height:200px;"><canvas id="vtOpPieCanvas"></canvas></div></div>',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Op Cycle Type Summary</div><div style="position:relative;height:200px;"><canvas id="vtOpCTCanvas"></canvas></div></div>',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Op Resource Usage Summary</div><div style="position:relative;height:200px;"><canvas id="vtOpResCanvas"></canvas></div></div>',
+              '</div>',
+
+              // Job Plots panel
+              '<div id="vtPlotsPanel_job" style="flex:1;overflow-y:auto;padding:8px;display:none;flex-direction:column;">',
+                '<div id="vtJobPlotsNote" style="font-size:0.78rem;color:#888;padding:4px 2px;font-family:72,Arial,sans-serif;"></div>',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Job Cycle Time Usage Summary</div><div style="position:relative;height:200px;"><canvas id="vtJobCTSCanvas"></canvas></div></div>',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Job Cycle Type</div><div style="position:relative;height:200px;"><canvas id="vtJobCTCanvas"></canvas></div></div>',
+                '<div class="vtPlotCard"><div class="vtPlotTitle">Job Resource Usage Summary</div><div style="position:relative;height:200px;"><canvas id="vtJobResCanvas"></canvas></div></div>',
+              '</div>',
+
+            '</div>'
+          ].join('')
         })]
       }),
       new sap.m.IconTabFilter({
@@ -3010,8 +3628,15 @@ sap.ui.getCore().attachInit(function () {
       })
     ],
     select: function (oEvent) {
-      if (oEvent.getParameter("key") === "design") {
+      var key = oEvent.getParameter("key");
+      if (key === "design") {
         setTimeout(function () { oTable.invalidate(); }, 0);
+      } else if (key === "plots") {
+        setTimeout(function () {
+          syncPlotsOpSelector();
+          var op = _plotsCurrentOp || oOpSelect.getSelectedKey();
+          if (op) { refreshPlots(op); }
+        }, 60);
       }
     }
   });
@@ -3063,6 +3688,7 @@ sap.ui.getCore().attachInit(function () {
   });
 
   // Initial ruler render, then load data
+  // _jobState is populated from project_metadata arriving in the /updateTree response
   updateRuler();
   loadOpNumbers();
 });
