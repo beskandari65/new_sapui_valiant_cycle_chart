@@ -5,13 +5,15 @@ To use a real SQLite DB, set DB_PATH and TABLE_NAME below.
 """
 
 try:
-    from flask import Flask, jsonify, send_file, request
+    from flask import Flask, jsonify, send_file, send_from_directory, request
 except ImportError:
     print("Flask not installed. Run:  pip install flask")
     raise SystemExit(1)
 
 import os
 import io
+import time
+import re
 import datetime
 import sqlite3
 
@@ -792,6 +794,9 @@ _ITEMS_DETAILS_SCHEMA = """
         designer_comments         TEXT,
         designer_resources_links  TEXT,
         designer_picture_links    TEXT,
+        control_comments          TEXT,
+        control_resources_links   TEXT,
+        control_picture_links     TEXT,
         machine_cycle_time_summary TEXT,
         total_machine_cycle        REAL DEFAULT 0.0,
         total_manual_cycle         REAL DEFAULT 0.0,
@@ -809,6 +814,15 @@ def _ensure_project_metadata_table(conn):
 
 def _ensure_items_details_table(conn):
     conn.execute(_ITEMS_DETAILS_SCHEMA)
+    # Migrate: add columns introduced after the initial schema
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(items_details)")}
+    for col, defn in [
+        ("control_comments",        "TEXT"),
+        ("control_resources_links", "TEXT"),
+        ("control_picture_links",   "TEXT"),
+    ]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE items_details ADD COLUMN {col} {defn}")
 
 
 @app.route("/api/items_details/<op_number>", methods=["GET"])
@@ -921,6 +935,246 @@ def api_export_excel():
         as_attachment=True,
         download_name=fname
     )
+
+
+def _parse_sheet_to_records(job_no, df):
+    """Parse one Excel sheet (already renamed columns) into flat DB records."""
+    import math, uuid
+
+    def _isnan(v):
+        try:
+            return math.isnan(float(v))
+        except (TypeError, ValueError):
+            return True
+
+    records        = []
+    station_step   = 0
+    station_index  = -1
+    process_step   = 1
+    process_index  = 0
+    current_st_id  = None
+    pending_st     = None
+    pending_procs  = []
+    max_id = max((r.get("id", 0) for r in SAMPLE_DATA), default=0) + 1
+
+    def _flush_station():
+        nonlocal max_id
+        if pending_st is None:
+            return
+        if pending_procs:
+            max_end = max(p["cycle_end"] for p in pending_procs)
+            pending_st["cycle_end"]  = max_end
+            pending_st["cycle_time"] = max_end
+        pending_st["subprocess"] = ",".join(p["item_id"] for p in pending_procs)
+        records.append(pending_st)
+        records.extend(pending_procs)
+
+    for _, row in df.iterrows():
+        title = row.get("title", "")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        title = title.strip()
+
+        ct_raw = row.get("cycle_time")
+        ce_raw = row.get("cycle_end")
+
+        if _isnan(ct_raw) and _isnan(ce_raw):
+            # ── Station row ──────────────────────────────────────────────────
+            _flush_station()
+            station_step  += 1
+            station_index += 1
+            process_step   = 1
+            process_index  = 0
+            sid = str(uuid.uuid4())
+            pending_st = {
+                "id": max_id, "item_id": sid, "op_number": job_no,
+                "title": title, "parent_id": "", "subprocess": "",
+                "cycle_type": "Station", "step": f"S{station_step}",
+                "tree_index": station_index,
+                "cycle_start": 0.0, "cycle_end": 0.0, "cycle_time": 0.0,
+                "highlight": "", "color": "#09528A",
+                "dependant_items": "{}", "run_cond_config": "{}",
+            }
+            max_id      += 1
+            pending_procs = []
+            current_st_id = sid
+
+        else:
+            # ── Process row ──────────────────────────────────────────────────
+            if current_st_id is None:
+                continue
+            try:
+                ct = round(float(ct_raw), 2) if not _isnan(ct_raw) else 0.0
+                ce = round(float(ce_raw), 2) if not _isnan(ce_raw) else 0.0
+            except (TypeError, ValueError):
+                ct = ce = 0.0
+            cs = round(ce - ct, 2)
+            pid = str(uuid.uuid4())
+            pending_procs.append({
+                "id": max_id, "item_id": pid, "op_number": job_no,
+                "title": title, "parent_id": current_st_id, "subprocess": "",
+                "cycle_type": "Undefined", "step": f"P{station_step}_{process_step}",
+                "tree_index": process_index,
+                "cycle_start": cs, "cycle_end": ce, "cycle_time": ct,
+                "highlight": "", "color": "#C0C0C0",
+                "dependant_items": "{}", "run_cond_config": "{}",
+            })
+            max_id       += 1
+            process_step += 1
+            process_index += 1
+
+    _flush_station()
+    return records
+
+
+def _insert_records_to_db(records):
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute(f"PRAGMA table_info({TABLE_NAME})")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for rec in records:
+        iid  = rec.get("item_id")
+        cols = [c for c in rec if c in existing_cols and c != "item_id"]
+        if not iid or not cols:
+            continue
+        all_cols = ["item_id"] + cols
+        ph       = ", ".join("?" for _ in all_cols)
+        vals     = [rec.get(c) for c in all_cols]
+        try:
+            cur.execute(
+                f"INSERT OR REPLACE INTO {TABLE_NAME} ({', '.join(all_cols)}) VALUES ({ph})",
+                vals,
+            )
+        except Exception as e:
+            print(f"[import_excel] DB error: {e}")
+    conn.commit()
+    conn.close()
+
+
+@app.route("/api/import_excel", methods=["POST"])
+def api_import_excel():
+    global SAMPLE_DATA
+
+    try:
+        import pandas as pd
+    except ImportError:
+        return jsonify({"status": "error",
+                        "message": "pandas not installed — run: pip install pandas openpyxl"}), 500
+
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file provided"}), 400
+
+    f = request.files["file"]
+    if not f.filename.lower().endswith((".xlsx", ".xls")):
+        return jsonify({"status": "error", "message": "File must be .xlsx or .xls"}), 400
+
+    try:
+        sheets = pd.read_excel(f, sheet_name=None, header=9)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Could not read Excel: {e}"}), 400
+
+    REQUIRED_COLS = {"DESCRIPTION", "SEC", "SEC.1"}
+    imported, skipped, errors = [], [], []
+
+    for sheet_name, df in sheets.items():
+        if not REQUIRED_COLS.issubset(df.columns):
+            skipped.append(f"{sheet_name} (missing columns: DESCRIPTION / SEC / SEC.1)")
+            continue
+        if sheet_name in get_op_numbers():
+            errors.append(f"{sheet_name} already exists")
+            continue
+
+        df = df.rename(columns={"DESCRIPTION": "title", "SEC": "cycle_time", "SEC.1": "cycle_end"})
+        records = _parse_sheet_to_records(sheet_name, df)
+        if not records:
+            skipped.append(f"{sheet_name} (no valid data)")
+            continue
+
+        if DB_PATH and os.path.exists(DB_PATH):
+            _insert_records_to_db(records)
+        else:
+            SAMPLE_DATA.extend(records)
+
+        OP_NUMBERS.add(sheet_name)
+        OP_METADATA[sheet_name] = {"op_title": "", "op_description": "", "num_of_parts": 1}
+        imported.append(sheet_name)
+
+    return jsonify({"status": "success", "imported": imported,
+                    "skipped": skipped, "errors": errors})
+
+
+def _pic_folder():
+    base = os.path.dirname(os.path.abspath(DB_PATH)) if DB_PATH else os.getcwd()
+    folder = os.path.join(base, "pic")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _safe_filename(name):
+    name = os.path.basename(name)
+    name = re.sub(r"[^\w.\-]", "_", name)
+    return name or "file"
+
+
+@app.route("/api/more_spec", methods=["POST"])
+def api_save_more_spec():
+    data    = request.get_json() or {}
+    item_id = data.get("item_id")
+    op      = data.get("op_number", "")
+    if not item_id:
+        return jsonify({"error": "item_id required"}), 400
+
+    allowed = {
+        "designer_comments", "designer_resources_links", "designer_picture_links",
+        "control_comments",  "control_resources_links",  "control_picture_links",
+    }
+    fields = {k: v for k, v in data.items() if k in allowed}
+    if not fields:
+        return jsonify({"ok": True})
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        _ensure_items_details_table(conn)
+        cur  = conn.cursor()
+        set_clause   = ", ".join(f"{k}=?" for k in fields)
+        update_vals  = list(fields.values()) + [item_id]
+        cur.execute(f"UPDATE items_details SET {set_clause} WHERE item_id=?", update_vals)
+        if cur.rowcount == 0:
+            cols = ["item_id", "op_number"] + list(fields.keys())
+            vals = [item_id, op] + list(fields.values())
+            cur.execute(
+                f"INSERT INTO items_details ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})",
+                vals,
+            )
+        conn.commit()
+        conn.close()
+    else:
+        cache = ITEMS_DETAILS.setdefault(op, [])
+        row   = next((r for r in cache if r.get("item_id") == item_id), None)
+        if row:
+            row.update(fields)
+        else:
+            cache.append({"item_id": item_id, "op_number": op, **fields})
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/upload_picture", methods=["POST"])
+def api_upload_picture():
+    if "file" not in request.files:
+        return jsonify({"error": "no file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    safe  = f"{int(time.time() * 1000)}_{_safe_filename(f.filename)}"
+    dest  = os.path.join(_pic_folder(), safe)
+    f.save(dest)
+    return jsonify({"filename": safe, "url": f"/api/pic/{safe}"})
+
+
+@app.route("/api/pic/<filename>", methods=["GET"])
+def api_get_picture(filename):
+    return send_from_directory(_pic_folder(), filename)
 
 
 if __name__ == "__main__":

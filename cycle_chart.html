@@ -12,6 +12,7 @@
     data-sap-ui-async="true">
   </script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
 
@@ -103,6 +104,17 @@
     /* Job toolbar compact — make it snug with just the border shadow */
     .sapMTB.sapUiSizeCompact { min-height: 2.25rem !important; }
 
+    /* More Spec dialog */
+    .vtMsForm { display:flex; flex-direction:column; gap:10px; padding:12px 4px; }
+    .vtMsLabel { font-size:0.8rem; font-weight:600; color:#6a6a6a; margin-bottom:2px; }
+    .vtPicZone { border:2px dashed #c9c9c9; border-radius:6px; padding:14px; text-align:center; color:#888; font-size:0.8rem; cursor:pointer; transition:border-color .15s,background .15s; }
+    .vtPicZone.vtPicOver { border-color:#0070c0; background:#f0f7ff; }
+    .vtPicGrid { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .vtPicThumb { position:relative; width:80px; height:80px; border-radius:4px; overflow:hidden; border:1px solid #ddd; cursor:pointer; }
+    .vtPicThumb img { width:100%; height:100%; object-fit:cover; display:block; }
+    .vtPicThumb .vtPicDel { display:none; position:absolute; top:2px; right:2px; background:rgba(0,0,0,.55); color:#fff; border:none; border-radius:3px; font-size:10px; padding:1px 4px; cursor:pointer; line-height:1.4; }
+    .vtPicThumb:hover .vtPicDel { display:block; }
+
     /* Statistics & Report tab — collapsible section cards */
     #vtStatsContent > * { flex-shrink: 0; }
     .vtStatSection { background:#fff; border:1px solid #e4e4e4; border-radius:6px; overflow:hidden; }
@@ -156,6 +168,7 @@ sap.ui.getCore().attachInit(function () {
   var _opMetaMap  = {};  // opNumber → { op_title, op_description, num_of_parts }
   var _opTreeCache      = {}; // opNumber → deep copy of tree items
   var _itemsDetailsCache = {}; // opNumber → array of station stat rows (from items_details table)
+  var _lastCellClickTime = 0; // for double-click detection on tree rows
 
   var clipboard = { items: [], mode: 'copy' };
 
@@ -1522,17 +1535,18 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function saveToDb() {
-    var items   = oDataModel.getProperty("/items");
-    var op      = oOpSelect.getSelectedKey();
-    var projMeta = _buildProjectMetadata();
-    var payload = {
+    var items    = oDataModel.getProperty("/items");
+    var op       = oOpSelect.getSelectedKey();
+    var payload  = {
       cycle_general_structure: stripClientFields(items),
+      items_details:           _buildItemsDetailsPayload(op, items),
       job_metadata:            _buildJobMetadata(op, items),
-      project_metadata:        projMeta,
+      project_metadata:        _buildProjectMetadata(),
       op_number:               op,
       ops_to_delete:           _opsToDelete.slice()
     };
-    console.log("[ValiantTMS] POST /updateDB payload:", JSON.stringify(payload, null, 2));
+
+    console.log("[ValiantTMS] POST /updateDB payload:", JSON.parse(JSON.stringify(payload)));
 
     fetch(API_BASE + "/updateDB", {
       method:  "POST",
@@ -1544,8 +1558,6 @@ sap.ui.getCore().attachInit(function () {
         console.log("[ValiantTMS] /updateDB:", r.status);
       })
       .catch(function (err) { console.warn("[ValiantTMS] /updateDB response error:", err.message); });
-
-    saveItemsDetails(op);
 
     _opsToDelete = [];
     sap.m.MessageToast.show("Saved");
@@ -2362,6 +2374,20 @@ sap.ui.getCore().attachInit(function () {
     if (oRcWaitSelectedIds.length) { applyWaitHighlights(); }
   });
 
+  // Double-click a tree row → open More Spec dialog
+  oTable.attachCellClick(function (oEvent) {
+    var now = Date.now();
+    if (now - _lastCellClickTime < 380) {
+      var rowIdx = oEvent.getParameter('rowIndex');
+      if (rowIdx < 0) return;
+      var ctx = oTable.getContextByIndex(rowIdx);
+      if (!ctx) return;
+      var item = ctx.getObject();
+      if (item && item.item_id) { _openMoreSpecDialog(item); }
+    }
+    _lastCellClickTime = now;
+  });
+
   // ── Column / ruler update helpers ─────────────────────────────────────────
   function updateGanttColumn() {
     oGanttColumn.setWidth((Math.ceil(scaleFactor * maxCycleEnd) + 50) + "px");
@@ -3040,6 +3066,12 @@ sap.ui.getCore().attachInit(function () {
           }
           sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
         }
+      }),
+      new sap.m.Button({
+        icon:    "sap-icon://upload-to-cloud",
+        type:    "Transparent",
+        tooltip: "Import Excel file (.xlsx / .xls / .xlsm) — adds stations to current Op (header on row 10, columns: DESCRIPTION, SEC, SEC.1)",
+        press: function () { document.getElementById('vtXlsxInput').click(); }
       }),
       new sap.m.ToolbarSpacer(),
       new sap.m.ToggleButton({
@@ -4019,31 +4051,41 @@ sap.ui.getCore().attachInit(function () {
     _renderBarChart('vtJobResCanvas', jrc.cats, jrc.vals, target);
   }
 
-  function saveItemsDetails(opNumber) {
-    var items      = _opTreeCache[opNumber] || oDataModel.getProperty('/items') || [];
-    var numOfParts = (_opMetaMap[opNumber] || {}).num_of_parts || 1;
-    var records    = items.map(function (station) {
-      var sums = _computeCycleTypeSums(station.sub_process_items || []);
-      return {
-        item_id:                station.item_id,
-        op_number:              opNumber,
-        total_machine_cycle:    Math.round(sums['Machine cycle']  * 100) / 100,
-        total_manual_cycle:     Math.round(sums['Manual cycle']   * 100) / 100,
-        total_robot_cycle:      Math.round(sums['Robot cycle']    * 100) / 100,
-        total_operator_cycle:   Math.round(sums['Operator wait']  * 100) / 100,
-        used_cycle_time:        Math.round((station.cycle_time / numOfParts) * 100) / 100,
-        num_of_parts:           numOfParts,
-        machine_cycle_time_summary: JSON.stringify(sums)
+  // Build the items_details list for the /updateDB payload.
+  // Recursively walk the full tree and build one items_details record per item.
+  // Stations get cycle-type sums; all items get merged designer spec fields.
+  function _buildItemsDetailsPayload(opNumber, items) {
+    var numOfParts    = (_opMetaMap[opNumber] || {}).num_of_parts || 1;
+    var cachedDetails = _itemsDetailsCache[opNumber] || {};
+    var records       = [];
+
+    function walk(item, isStation) {
+      var cached = cachedDetails[item.item_id] || {};
+      var record = {
+        item_id:                  item.item_id,
+        op_number:                opNumber,
+        designer_comments:        cached.designer_comments        || null,
+        designer_resources_links: cached.designer_resources_links || null,
+        designer_picture_links:   cached.designer_picture_links   || null
       };
-    });
-    if (!records.length) return;
-    fetch(API_BASE + '/api/items_details', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ op_number: opNumber, records: records })
-    })
-      .then(function (r) { console.log('[ValiantTMS] items_details saved:', r.status); })
-      .catch(function (err) { console.warn('[ValiantTMS] items_details error:', err.message); });
+
+      if (isStation) {
+        var sums = _computeCycleTypeSums(item.sub_process_items || []);
+        record.machine_cycle_time_summary = JSON.stringify(sums);
+        record.total_machine_cycle  = Math.round(sums['Machine cycle']  * 100) / 100;
+        record.total_manual_cycle   = Math.round(sums['Manual cycle']   * 100) / 100;
+        record.total_robot_cycle    = Math.round(sums['Robot cycle']    * 100) / 100;
+        record.total_operator_cycle = Math.round(sums['Operator wait']  * 100) / 100;
+        record.used_cycle_time      = Math.round((item.cycle_time / numOfParts) * 100) / 100;
+        record.num_of_parts         = numOfParts;
+      }
+
+      records.push(record);
+      (item.sub_process_items || []).forEach(function (child) { walk(child, false); });
+    }
+
+    items.forEach(function (station) { walk(station, true); });
+    return records;
   }
 
   window.vtSwitchStationTab = function (stIdSafe, opSuffix) {
@@ -4210,6 +4252,417 @@ sap.ui.getCore().attachInit(function () {
 
     html += '</tbody></table></div>';
     content.innerHTML = html;
+  }
+
+  // ── Excel import (client-side via SheetJS) ───────────────────────────────────
+
+  // Port of parse_excel_to_db_2: build station/process tree from raw rows.
+  // ctIdx = first SEC column (cycle_time), ceIdx = second SEC column (cycle_end).
+  function _vtBuildStations(rows, descIdx, ctIdx, ceIdx) {
+    var stations  = [];
+    var curSt     = null;
+    var prevStId  = null;
+    var prevProcId = null;
+    var stStep    = 0, pStep = 1, pIdx = 0;
+    var stRowIdx  = -1;
+
+    function genId() { return crypto.randomUUID ? crypto.randomUUID() : 'xl_' + Math.random().toString(36).substr(2, 9); }
+    function blank(v) { return v === null || v === undefined || v === '' || (typeof v === 'number' && isNaN(v)); }
+    function r2(v)    { return Math.round(v * 100) / 100; }
+
+    rows.forEach(function (row, rowIdx) {
+      var title = row[descIdx];
+      if (!title || typeof title !== 'string' || !title.trim()) return;
+      title = title.trim();
+
+      var ctVal = row[ctIdx];
+      var ceVal = row[ceIdx];
+
+      if (blank(ctVal) && blank(ceVal)) {
+        // ── STATION ROW ──────────────────────────────────────────────────────
+        stStep++;  pStep = 1;  pIdx = 0;  prevProcId = null;  stRowIdx = rowIdx;
+
+        var stId = genId();
+        var stRc = prevStId
+          ? { Start: { 'After...': [prevStId], Offset: [0.0] } }
+          : { Start: { 'First Station': [],     Offset: [0.0] } };
+
+        curSt = {
+          item_id:          stId,
+          parent_id:        '',
+          title:            title,
+          cycle_type:       'Station',
+          step:             'S' + stStep,
+          tree_index:       stations.length,
+          cycle_start:      0,
+          cycle_end:        0,
+          cycle_time:       0,
+          subprocess:       '',
+          sub_process_items: [],
+          highlight:        '',
+          dependant_items:  '{}',
+          run_cond_config:  JSON.stringify(stRc)
+        };
+        prevStId = stId;
+        stations.push(curSt);
+
+      } else {
+        // ── PROCESS ROW ──────────────────────────────────────────────────────
+        if (!curSt) return;
+
+        var ct = typeof ctVal === 'number' ? r2(ctVal) : 0;
+        var ce = typeof ceVal === 'number' ? r2(ceVal) : 0;
+        var cs = r2(ce - ct);
+
+        var pid = genId();
+        var procRc;
+        if (cs === 0 || rowIdx === stRowIdx + 1) {
+          procRc = { Start: { 'From Zero': [''], Offset: [0.0] }, Cycle: { 'Custom value': [ct] } };
+        } else {
+          procRc = { Start: { 'After...': [prevProcId || ''], Offset: [0.0] }, Cycle: { 'Custom value': [ct] } };
+        }
+
+        curSt.sub_process_items.push({
+          item_id:          pid,
+          parent_id:        curSt.item_id,
+          title:            title,
+          cycle_type:       'Undefined',
+          step:             'P' + stStep + '_' + pStep,
+          tree_index:       pIdx,
+          cycle_start:      cs,
+          cycle_end:        ce,
+          cycle_time:       ct,
+          subprocess:       '',
+          sub_process_items: [],
+          highlight:        '',
+          dependant_items:  '{}',
+          run_cond_config:  JSON.stringify(procRc)
+        });
+        curSt.subprocess += (curSt.subprocess ? ',' : '') + pid;
+
+        prevProcId = pid;
+        pStep++;
+        pIdx++;
+      }
+    });
+    return stations;
+  }
+
+  // Scan the first 25 rows for a cell whose trimmed text is "DESCRIPTION".
+  function _vtFindHeader(rawRows) {
+    for (var i = 0; i < Math.min(rawRows.length, 25); i++) {
+      var row = rawRows[i] || [];
+      for (var j = 0; j < row.length; j++) {
+        if (String(row[j] || '').trim() === 'DESCRIPTION') return i;
+      }
+    }
+    return -1;
+  }
+
+  // Create one new op per sheet entry.  Each sheet_name becomes the op_number
+  // (mirrors Python handle_dropped_file / parse_excel_to_db_2).
+  function _vtCreateOpsFromSheets(sheetDataList) {
+    var existing = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+    var created  = [];
+    var skipped  = [];
+
+    _cacheCurrentOp();   // save whatever is currently visible before we switch
+
+    sheetDataList.forEach(function (sheet) {
+      var opName = sheet.name;
+
+      // Skip duplicates (both from DB and within this batch)
+      if (existing.indexOf(opName) >= 0) { skipped.push(opName); return; }
+      existing.push(opName);   // guard against duplicate sheets in the same file
+
+      var stations = sheet.stations;
+
+      // Anchor first station at t = 0 and run the same recalc that recalcTree() does
+      if (stations.length > 0) {
+        var rc0     = parseRC(stations[0].run_cond_config);
+        rc0.start   = { condition: RC_COND.FIRST_STATION, values: [], offset: 0.0 };
+        stations[0].run_cond_config = serializeRC(rc0);
+        stations[0].cycle_start = 0.0;
+      }
+      var tmpFlatMap = buildFlatMap(stations, {});
+      stations.forEach(function (st) { handleProcessCalc(st, tmpFlatMap); });
+      annotateSteps(stations, null);
+
+      // Store in in-memory caches (no _ancestorEnds needed in cache)
+      _opMetaMap[opName]   = {};
+      _opTreeCache[opName] = JSON.parse(JSON.stringify(stations));
+
+      // Add op to dropdown
+      oOpSelect.addItem(new sap.ui.core.Item({ key: opName, text: opName }));
+
+      // Persist to DB immediately
+      fetch(API_BASE + '/updateDB', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          cycle_general_structure: stripClientFields(stations),
+          items_details:           _buildItemsDetailsPayload(opName, stations),
+          job_metadata:            _buildJobMetadata(opName, stations),
+          op_number:               opName,
+          ops_to_delete:           []
+        })
+      })
+        .then(function (r) { console.log('[vtImport] saved op "' + opName + '":', r.status); })
+        .catch(function (err) { console.warn('[vtImport] save error "' + opName + '":', err.message); });
+
+      created.push(opName);
+    });
+
+    if (created.length > 0) {
+      var lastOp = created[created.length - 1];
+      oOpSelect.setSelectedKey(lastOp);
+      _loadTreeFromCache(lastOp);
+    }
+
+    var msg = 'Created ' + created.length + ' op(s)';
+    if (skipped.length) msg += '; skipped (already exist): ' + skipped.join(', ');
+    sap.m.MessageToast.show(msg + '.');
+  }
+
+  function _vtParseExcel(file) {
+    if (typeof XLSX === 'undefined') { sap.m.MessageToast.show('SheetJS library not loaded.'); return; }
+
+    var reader = new FileReader();
+    reader.onload = function (e) {
+      try {
+        var wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+
+        // Scan every sheet; collect those that have DESCRIPTION + two SEC columns
+        var validSheets = [];
+        wb.SheetNames.forEach(function (name) {
+          var rawRows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: null });
+          var hdrIdx  = _vtFindHeader(rawRows);
+          if (hdrIdx < 0) return;
+          var hdr = rawRows[hdrIdx] || [];
+          var descIdx = -1, ctIdx = -1, ceIdx = -1;
+          hdr.forEach(function (h, i) {
+            var s = String(h || '').trim();
+            if (s === 'DESCRIPTION') { descIdx = i; }
+            else if (s === 'SEC') { if (ctIdx < 0) ctIdx = i; else if (ceIdx < 0) ceIdx = i; }
+          });
+          if (descIdx < 0 || ctIdx < 0 || ceIdx < 0) return;
+          var stations = _vtBuildStations(rawRows.slice(hdrIdx + 1), descIdx, ctIdx, ceIdx);
+          console.log('[vtImport] sheet "' + name + '": hdrIdx=' + hdrIdx +
+            ' cols=' + descIdx + '/' + ctIdx + '/' + ceIdx +
+            ' stations=' + stations.length);
+          if (stations.length) validSheets.push({ name: name, stations: stations });
+        });
+
+        if (!validSheets.length) {
+          sap.m.MessageToast.show('No cycle data found. Expected columns: DESCRIPTION + SEC (×2).');
+          return;
+        }
+
+        // Single sheet → import directly with no dialog
+        if (validSheets.length === 1) {
+          _vtCreateOpsFromSheets(validSheets);
+          return;
+        }
+
+        // Multiple sheets → let user pick one, a subset, or all
+        var oList = new sap.m.List();
+        validSheets.forEach(function (s) {
+          (function (sheet) {
+            oList.addItem(new sap.m.StandardListItem({
+              title:       sheet.name,
+              description: sheet.stations.length + ' station(s)',
+              type:        'Active',
+              press:       function () { oDialog.close(); _vtCreateOpsFromSheets([sheet]); }
+            }));
+          }(s));
+        });
+
+        var oDialog = new sap.m.Dialog({
+          title:       'Import sheets as new ops  (' + validSheets.length + ' found)',
+          content:     [oList],
+          beginButton: new sap.m.Button({
+            text:  'Import All',
+            type:  'Emphasized',
+            press: function () { oDialog.close(); _vtCreateOpsFromSheets(validSheets); }
+          }),
+          endButton: new sap.m.Button({ text: 'Cancel', press: function () { oDialog.close(); } }),
+          afterClose: function () { oDialog.destroy(); }
+        });
+        oDialog.open();
+
+      } catch (err) {
+        sap.m.MessageToast.show('Parse error: ' + err.message);
+        console.error('[vtImport] parse error', err);
+      }
+    };
+    reader.onerror = function () { sap.m.MessageToast.show('Could not read file.'); };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ── More Spec dialog ─────────────────────────────────────────────────────────
+
+  function _msSave(itemId, op, fields) {
+    var payload = Object.assign({ item_id: itemId, op_number: op }, fields);
+    // update in-memory cache immediately
+    var cache = _itemsDetailsCache[op] || (_itemsDetailsCache[op] = {});
+    if (!cache[itemId]) cache[itemId] = {};
+    Object.assign(cache[itemId], fields);
+    fetch(API_BASE + '/api/more_spec', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload)
+    }).catch(function (err) { console.warn('[vtMoreSpec] save error:', err.message); });
+  }
+
+  function _msDebounce(fn, ms) {
+    var t;
+    return function () { clearTimeout(t); t = setTimeout(fn, ms); };
+  }
+
+  function _msBuildPicSection(tabKey, itemId, op, initialPics) {
+    // returns { html: sap.ui.core.HTML, refresh: fn(picsArray) }
+    var pics = (initialPics || '').split(';').filter(Boolean);
+
+    function render() {
+      var thumbsHtml = pics.map(function (url, i) {
+        return '<div class="vtPicThumb">' +
+          '<img src="' + url + '" onclick="window.open(\'' + url + '\',\'_blank\')">' +
+          '<button class="vtPicDel" onclick="vtMsDelPic(\'' + tabKey + '\',' + i + ')">✕</button>' +
+          '</div>';
+      }).join('');
+      var el = document.getElementById('vtPicGrid_' + tabKey);
+      if (el) el.innerHTML = thumbsHtml;
+    }
+
+    window['vtMsDelPic'] = function (key, idx) {
+      if (key !== tabKey) return;
+      pics.splice(idx, 1);
+      render();
+      _msSave(itemId, op, { [tabKey === 'mech' ? 'designer_picture_links' : 'control_picture_links']: pics.join(';') });
+    };
+
+    var dropHtml = new sap.ui.core.HTML({
+      content: '<div class="vtPicZone" id="vtPicZone_' + tabKey + '">' +
+               '↓ Drop images here or click to upload' +
+               '<input type="file" id="vtPicInput_' + tabKey + '" accept="image/*" multiple style="display:none">' +
+               '</div>' +
+               '<div class="vtPicGrid" id="vtPicGrid_' + tabKey + '"></div>',
+      afterRendering: function () {
+        render();
+        var zone  = document.getElementById('vtPicZone_' + tabKey);
+        var input = document.getElementById('vtPicInput_' + tabKey);
+        if (!zone || !input) return;
+
+        zone.addEventListener('click', function () { input.click(); });
+        zone.addEventListener('dragover', function (e) { e.preventDefault(); zone.classList.add('vtPicOver'); });
+        zone.addEventListener('dragleave', function () { zone.classList.remove('vtPicOver'); });
+        zone.addEventListener('drop', function (e) {
+          e.preventDefault(); zone.classList.remove('vtPicOver');
+          _msUploadFiles(Array.from(e.dataTransfer.files), tabKey, itemId, op, pics, render);
+        });
+        input.addEventListener('change', function () {
+          _msUploadFiles(Array.from(input.files), tabKey, itemId, op, pics, render);
+          input.value = '';
+        });
+      }
+    });
+    return dropHtml;
+  }
+
+  function _msUploadFiles(files, tabKey, itemId, op, picsArr, renderFn) {
+    var picField = tabKey === 'mech' ? 'designer_picture_links' : 'control_picture_links';
+    files.forEach(function (file) {
+      if (!file.type.startsWith('image/')) return;
+      var fd = new FormData();
+      fd.append('file', file);
+      fetch(API_BASE + '/api/upload_picture', { method: 'POST', body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (res.url) {
+            picsArr.push(res.url);
+            renderFn();
+            _msSave(itemId, op, { [picField]: picsArr.join(';') });
+          }
+        })
+        .catch(function (err) { console.warn('[vtMoreSpec] upload error:', err.message); });
+    });
+  }
+
+  function _msBuildTabContent(tabKey, itemId, op, details) {
+    var commentField = tabKey === 'mech' ? 'designer_comments'        : 'control_comments';
+    var linksField   = tabKey === 'mech' ? 'designer_resources_links' : 'control_resources_links';
+    var picField     = tabKey === 'mech' ? 'designer_picture_links'   : 'control_picture_links';
+
+    var oComments = new sap.m.TextArea({
+      value:       details[commentField] || '',
+      rows:        4,
+      width:       '100%',
+      placeholder: 'Add comments...',
+      liveChange:  _msDebounce(function () {
+        _msSave(itemId, op, { [commentField]: oComments.getValue() });
+      }, 600)
+    });
+
+    var oLinks = new sap.m.TextArea({
+      value:       details[linksField] || '',
+      rows:        2,
+      width:       '100%',
+      placeholder: 'https://...',
+      liveChange:  _msDebounce(function () {
+        _msSave(itemId, op, { [linksField]: oLinks.getValue() });
+      }, 600)
+    });
+
+    var oPicSection = _msBuildPicSection(tabKey, itemId, op, details[picField] || '');
+
+    return new sap.m.VBox({
+      renderType: 'Bare',
+      items: [
+        new sap.m.VBox({ renderType: 'Bare', items: [
+          new sap.m.Label({ text: 'Comments' }).addStyleClass('vtMsLabel'),
+          oComments
+        ]}).addStyleClass('vtMsForm'),
+        new sap.m.VBox({ renderType: 'Bare', items: [
+          new sap.m.Label({ text: 'Links' }).addStyleClass('vtMsLabel'),
+          oLinks
+        ]}).addStyleClass('vtMsForm'),
+        new sap.m.VBox({ renderType: 'Bare', items: [
+          new sap.m.Label({ text: 'Pictures' }).addStyleClass('vtMsLabel'),
+          oPicSection
+        ]}).addStyleClass('vtMsForm')
+      ]
+    });
+  }
+
+  function _openMoreSpecDialog(item) {
+    var op      = oOpSelect.getSelectedKey();
+    var details = ((_itemsDetailsCache[op] || {})[item.item_id]) || {};
+
+    var oIconTab = new sap.m.IconTabBar({
+      stretchContentHeight: true,
+      items: [
+        new sap.m.IconTabFilter({
+          text: 'Mechanical Design',
+          content: [_msBuildTabContent('mech', item.item_id, op, details)]
+        }),
+        new sap.m.IconTabFilter({
+          text: 'Control',
+          content: [_msBuildTabContent('ctrl', item.item_id, op, details)]
+        })
+      ]
+    });
+
+    var oDialog = new sap.m.Dialog({
+      title:         (item.step || '') + '  ' + (item.title || '') + '  — More Specifications',
+      contentWidth:  '620px',
+      contentHeight: '540px',
+      draggable:     true,
+      resizable:     true,
+      content:       [new sap.m.ScrollContainer({ vertical: true, horizontal: false, height: '100%', content: [oIconTab] })],
+      endButton:     new sap.m.Button({ text: 'Close', press: function () { oDialog.close(); } }),
+      afterClose:    function () { oDialog.destroy(); }
+    });
+    oDialog.open();
   }
 
   window.vtToggleSection = function (id) {
@@ -4506,6 +4959,60 @@ sap.ui.getCore().attachInit(function () {
     if (e.target.closest('tr.sapUiTableRow')) return;
     clearRowHighlight();
   });
+
+  // ── Excel drag-drop: hidden file input + full-screen overlay ─────────────────
+  (function () {
+    // Hidden file input (browse button triggers this)
+    var inp = document.createElement('input');
+    inp.type = 'file'; inp.id = 'vtXlsxInput'; inp.accept = '.xlsx,.xls,.xlsm';
+    inp.style.display = 'none';
+    inp.addEventListener('change', function () {
+      if (inp.files && inp.files[0]) { _vtParseExcel(inp.files[0]); inp.value = ''; }
+    });
+    document.body.appendChild(inp);
+
+    // Full-screen translucent overlay shown while dragging an Excel file
+    var ov = document.createElement('div');
+    ov.id = 'vtXlsxOverlay';
+    ov.style.cssText =
+      'display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;' +
+      'background:rgba(9,82,138,0.16);align-items:center;justify-content:center;pointer-events:none;';
+    ov.innerHTML =
+      '<div style="background:#fff;border:3px dashed #09528A;border-radius:14px;' +
+      'padding:40px 64px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.18);">' +
+      '<div style="font-size:2.5rem;margin-bottom:10px;">&#128229;</div>' +
+      '<div style="font-family:72,Arial,sans-serif;font-size:1rem;font-weight:600;color:#09528A;">' +
+      'Drop to add stations to current Op</div></div>';
+    document.body.appendChild(ov);
+
+    function isFileDrag(e) {
+      return e.dataTransfer && e.dataTransfer.types &&
+             Array.prototype.some.call(e.dataTransfer.types, function (t) { return t === 'Files'; });
+    }
+
+    document.addEventListener('dragover', function (e) {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      ov.style.display = 'flex';
+    });
+    document.addEventListener('dragleave', function (e) {
+      if (e.relatedTarget === null || e.relatedTarget === document.documentElement) {
+        ov.style.display = 'none';
+      }
+    });
+    document.addEventListener('drop', function (e) {
+      ov.style.display = 'none';
+      var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file || !/\.xlsx?m?$/i.test(file.name)) return;
+      e.preventDefault();
+      if (oIconTabBar.getSelectedKey() !== 'design') {
+        oIconTabBar.setSelectedKey('design');
+        setTimeout(function () { _vtParseExcel(file); }, 100);
+      } else {
+        _vtParseExcel(file);
+      }
+    });
+  }());
 
   // Initial ruler render, then load data
   // _jobState is populated from project_metadata arriving in the /updateTree response
