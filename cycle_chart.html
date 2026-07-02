@@ -140,6 +140,15 @@
     .vtCardFull { flex:1 1 100%; }
     .vtPlotTitle { font-size:0.8rem; font-weight:600; color:#32363a; margin-bottom:6px; text-align:center; font-family:72,Arial,sans-serif; }
 
+    /* Job number badge in the job toolbar */
+    .vtJobNumBadge.sapMText { font-weight:700; font-size:0.82rem; color:#0854a0; padding:1px 6px; letter-spacing:0.01em; }
+
+    /* Job / Op section pills inside the job toolbar */
+    .vtJobSection, .vtOpSection { display:flex !important; align-items:center !important; padding:2px 6px 2px 6px !important; border-radius:5px; gap:2px; }
+    .vtJobSection { background:rgba(8,84,160,0.13); border: 1px solid rgba(8,84,160,0.22); }
+    .vtOpSection  { background:rgba(200,100,0,0.10); border: 1px solid rgba(200,100,0,0.22); }
+    .vtJobSection .sapMLabel, .vtOpSection .sapMLabel { font-weight:600; font-size:0.8rem; color:#444; padding-right:2px; white-space:nowrap; }
+
   </style>
 </head>
 <body class="sapUiBody">
@@ -168,6 +177,9 @@ sap.ui.getCore().attachInit(function () {
   var _opMetaMap  = {};  // opNumber → { op_title, op_description, num_of_parts }
   var _opTreeCache      = {}; // opNumber → deep copy of tree items
   var _itemsDetailsCache = {}; // opNumber → array of station stat rows (from items_details table)
+  var _projectOpMap     = {}; // projectNumber → [opNumbers] — populated from /updateProjectNumbers
+  var _suppressOpChange      = false; // prevent oOpSelect.change from firing during programmatic repopulation
+  var _rcCycleSapEnterDone   = false; // prevents double-apply when Enter is pressed in cycle-time StepInput
   var _lastCellClickTime = 0; // for double-click detection on tree rows
 
   var clipboard = { items: [], mode: 'copy' };
@@ -1263,46 +1275,64 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function removeProcess() {
-    if (!oSelectedItemId) {
+    var idsToDelete = oRcState.activeItemIds.slice();
+    if (!idsToDelete.length) {
       sap.m.MessageToast.show("Click a row first to select a process to remove");
       return;
     }
-    var items   = oDataModel.getProperty("/items");
-    var selItem = findItemById(items, oSelectedItemId);
-    if (!selItem) {
-      sap.m.MessageToast.show("Selected item not found");
-      return;
-    }
-    var itemId = selItem.item_id;
 
-    // Capture siblings context BEFORE deletion so we know who comes next
-    var flatMap0    = buildFlatMap(items, {});
-    var ctx0        = getSiblingsContext(items, selItem, flatMap0);
-    var prevSibling = ctx0.idx > 0 ? ctx0.siblings[ctx0.idx - 1] : null;
+    var label = idsToDelete.length === 1 ? '1 process' : idsToDelete.length + ' processes';
+    if (!window.confirm('Delete ' + label + '?')) return;
 
-    removeItemFromTree(items, oSelectedItemId);
-    oSelectedItemId = null;
+    var items    = oDataModel.getProperty("/items");
+    var flatMap0 = buildFlatMap(items, {});
 
-    // Patch the RC of whatever item is now after prevSibling.
-    if (prevSibling) {
-      organizeRcAfterChange(items, buildFlatMap(items, {}), prevSibling, true, false);
-    }
+    // Capture unique prevSiblings before any deletion (skip if the prev is also being deleted)
+    var seenPrev = {};
+    var prevSiblings = [];
+    idsToDelete.forEach(function (id) {
+      var item = flatMap0[id];
+      if (!item) return;
+      var ctx  = getSiblingsContext(items, item, flatMap0);
+      var prev = ctx.idx > 0 ? ctx.siblings[ctx.idx - 1] : null;
+      if (prev && idsToDelete.indexOf(prev.item_id) < 0 && !seenPrev[prev.item_id]) {
+        seenPrev[prev.item_id] = true;
+        prevSiblings.push(prev.item_id);
+      }
+    });
 
+    // Remove all selected items from the tree
+    idsToDelete.forEach(function (id) { removeItemFromTree(items, id); });
+
+    // Patch RC for items now following each surviving prevSibling
+    var flatMapAfter = buildFlatMap(items, {});
+    prevSiblings.forEach(function (prevId) {
+      var prev = flatMapAfter[prevId];
+      if (prev) organizeRcAfterChange(items, flatMapAfter, prev, true, false);
+    });
+
+    clearRowHighlight();
     recalcTree();
 
-    fetch(API_BASE + '/removeProcess', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ item_id: itemId })
-    })
-      .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
-      .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
+    idsToDelete.forEach(function (id) {
+      fetch(API_BASE + '/removeProcess', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ item_id: id })
+      })
+        .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
+        .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
+    });
 
-    sap.m.MessageToast.show("Process removed");
+    sap.m.MessageToast.show(label.charAt(0).toUpperCase() + label.slice(1) + ' removed.');
   }
 
   // ── Add Process ───────────────────────────────────────────────────────────
   function addNewProcess() {
+    if (!oOpSelect.getSelectedKey()) {
+      sap.m.MessageToast.show("Select an op/cell first.");
+      return;
+    }
     var items    = oDataModel.getProperty("/items");
     var currItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
 
@@ -1489,12 +1519,23 @@ sap.ui.getCore().attachInit(function () {
     });
   }
 
+  function _tagOpNumber(items, op) {
+    var projNo = _jobState.job_number || '';
+    return (items || []).map(function (item) {
+      item.op_number     = op;
+      item.project_number = projNo;
+      _tagOpNumber(item.sub_process_items, op);
+      return item;
+    });
+  }
+
   function _buildJobMetadata(op, items) {
     var meta          = _opMetaMap[op] || {};
     var stationList   = (items || []).map(function (item) { return item.item_id; }).join(",");
     var usedCycleTime = getMaxCycleEnd(items);
     var sums          = _computeCycleTypeSums(items);
     return {
+      project_number:             _jobState.job_number || '',
       op_number:                  op,
       op_title:                   meta.op_title       || null,
       job_description:            meta.op_description || null,
@@ -1538,11 +1579,11 @@ sap.ui.getCore().attachInit(function () {
     var items    = oDataModel.getProperty("/items");
     var op       = oOpSelect.getSelectedKey();
     var payload  = {
-      cycle_general_structure: stripClientFields(items),
+      op_number:               op,
+      cycle_general_structure: stripClientFields(_tagOpNumber(items, op)),
       items_details:           _buildItemsDetailsPayload(op, items),
       job_metadata:            _buildJobMetadata(op, items),
       project_metadata:        _buildProjectMetadata(),
-      op_number:               op,
       ops_to_delete:           _opsToDelete.slice()
     };
 
@@ -2370,11 +2411,14 @@ sap.ui.getCore().attachInit(function () {
       nAutoExpandLevel = 0;
       oTable.expandToLevel(lvl);
     }
-    if (oRcState.activeItemIds.length) { applyRowHighlight(); }
+    if (oRcState.activeItemIds.length) {
+      applyRowHighlight();
+      if (oRcState.activeItemIds.length === 1) { _showRcSigns(getCurrentItem()); }
+    }
     if (oRcWaitSelectedIds.length) { applyWaitHighlights(); }
   });
 
-  // Double-click a tree row → open More Spec dialog
+  // Double-click a tree row → Gantt bar: focus cycle time input; other cells: open More Spec dialog
   oTable.attachCellClick(function (oEvent) {
     var now = Date.now();
     if (now - _lastCellClickTime < 380) {
@@ -2383,7 +2427,13 @@ sap.ui.getCore().attachInit(function () {
       var ctx = oTable.getContextByIndex(rowIdx);
       if (!ctx) return;
       var item = ctx.getObject();
-      if (item && item.item_id) { _openMoreSpecDialog(item); }
+      if (!item || !item.item_id) return;
+      var cellDom = oEvent.getParameter('cellDomRef');
+      if (cellDom && cellDom.querySelector('.vtCycleBarRoot')) {
+        oRcCycleValueInput.focus();
+      } else {
+        _openMoreSpecDialog(item);
+      }
     }
     _lastCellClickTime = now;
   });
@@ -2421,7 +2471,12 @@ sap.ui.getCore().attachInit(function () {
 
   function _applyProjectMeta(projectMeta) {
     if (!projectMeta) return;
-    if (projectMeta.project_no)         _jobState.job_number           = projectMeta.project_no;
+    // Only update job_number from DB if the dropdown hasn't already set it.
+    // The job dropdown is the source of truth; don't let a stale LIMIT-1 row overwrite it.
+    if (projectMeta.project_no && !_jobState.job_number) {
+      _jobState.job_number = projectMeta.project_no;
+      if (oJobNumLabel) oJobNumLabel.setText('#' + projectMeta.project_no);
+    }
     if (projectMeta.project_title)      _jobState.job_title            = projectMeta.project_title;
     if (projectMeta.project_description)_jobState.job_description      = projectMeta.project_description;
     if (projectMeta.target_cycle_time)  _jobState.target_cycle_time    = projectMeta.target_cycle_time;
@@ -2461,12 +2516,14 @@ sap.ui.getCore().attachInit(function () {
         });
 
         // Cache items_details rows keyed by item_id for fast lookup
+        console.log('[vtItemsDetails] op:', opNumber, '— rows received:', itemsDetailRows.length, itemsDetailRows);
         if (itemsDetailRows.length) {
           _itemsDetailsCache[opNumber] = {};
           itemsDetailRows.forEach(function (row) {
             if (row.item_id) { _itemsDetailsCache[opNumber][row.item_id] = row; }
           });
         }
+        console.log('[vtItemsDetails] cache after load:', JSON.parse(JSON.stringify(_itemsDetailsCache)));
 
         _applyProjectMeta(projectMetaRows[0] || null);
         annotateSteps(items, null);
@@ -2495,6 +2552,7 @@ sap.ui.getCore().attachInit(function () {
     _updateResourceUsageInCache(opNumber);
     updateGanttColumn();
     updateRuler();
+    setTimeout(_updateMiniPie, 0);
     if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
   }
 
@@ -2505,26 +2563,45 @@ sap.ui.getCore().attachInit(function () {
     }
   }
 
-  function loadOpNumbers() {
-    fetch(API_BASE + "/updateOpNumbers", { method: "POST" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
+  function _populateOpSelect(jobKey) {
+    var ops = _projectOpMap[jobKey] || [];
+    _suppressOpChange = true;
+    oOpSelect.removeAllItems();
+    oOpSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select op…" }));
+    ops.forEach(function (op) {
+      oOpSelect.addItem(new sap.ui.core.Item({ key: op, text: op }));
+    });
+    oOpSelect.setSelectedKey("");
+    oDataModel.setData({ items: [], maxCycleEnd: 500 });
+    // Release flag after current tick so any queued SAPUI5 change events
+    // from removeAllItems/setSelectedKey are still suppressed
+    setTimeout(function () { _suppressOpChange = false; }, 0);
+    return ops;
+  }
+
+  function loadProjectList() {
+    fetch(API_BASE + '/updateProjectNumbers', { method: 'POST' })
+      .then(function (r) { return r.json(); })
       .then(function (response) {
-        var ops = response.data || [];
-        ops.forEach(function (op) {
-          oOpSelect.addItem(new sap.ui.core.Item({ key: op, text: op }));
+        _projectOpMap = response.data || {};
+        var projNums  = Object.keys(_projectOpMap);
+
+        oJobSelect.removeAllItems();
+        oJobSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select Job…" }));
+        projNums.forEach(function (pn) {
+          oJobSelect.addItem(new sap.ui.core.Item({ key: pn, text: pn }));
         });
-        if (ops.length > 0) {
-          oOpSelect.setSelectedKey(ops[0]);
-          loadTree(ops[0]);
+
+        if (projNums.length > 0) {
+          var firstJob = projNums[0];
+          oJobSelect.setSelectedKey(firstJob);
+          _jobState.job_number = firstJob;
+          var ops = _populateOpSelect(firstJob);
         }
       })
-      .catch(function () {
-        sap.m.MessageToast.show(
-          "Cannot reach server. Make sure FastAPI is running (uvicorn main:app --reload)."
-        );
+      .catch(function (err) {
+        sap.m.MessageToast.show('Cannot reach server. Make sure FastAPI is running.');
+        console.warn('[loadProjectList] error:', err);
       });
   }
 
@@ -2548,11 +2625,23 @@ sap.ui.getCore().attachInit(function () {
 
   // ── Op number select ──────────────────────────────────────────────────────
   var oOpSelect = new sap.m.Select({
+    forceSelection: false,
     change: function (oEvent) {
-      var op = oEvent.getParameter("selectedItem").getKey();
+      if (_suppressOpChange) return;
+      var op = oEvent.getParameter("selectedItem") && oEvent.getParameter("selectedItem").getKey();
+      if (!op) {
+        oDataModel.setData({ items: [], maxCycleEnd: 500 });
+        maxCycleEnd = 0;
+        updateGanttColumn();
+        updateRuler();
+        setTimeout(_updateMiniPie, 0);
+        if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
+        return;
+      }
       if (_opTreeCache[op]) { _loadTreeFromCache(op); } else { loadTree(op); }
     }
   });
+  oOpSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select op…" }));
 
   // ── Legend item helper ────────────────────────────────────────────────────
   function legendItem(color, label) {
@@ -2649,9 +2738,12 @@ sap.ui.getCore().attachInit(function () {
       oOpSelect.setSelectedKey(opNum);
       _loadTreeFromCache(opNum);
       var newOpPayload = {
+        op_number:               opNum,
         cycle_general_structure: [],
+        items_details:           [],
         job_metadata:            _buildJobMetadata(opNum, []),
-        op_number:               opNum
+        project_metadata:        _buildProjectMetadata(),
+        ops_to_delete:           []
       };
       fetch(API_BASE + "/updateDB", {
         method:  "POST",
@@ -2677,7 +2769,7 @@ sap.ui.getCore().attachInit(function () {
       new sap.m.HBox({ alignItems: "Center", renderType: "Bare",
         items: [new sap.m.Label({ text: "# of Parts:",          width: "110px" }), oOpPartsInput] })
     ]}).addStyleClass("vtDialogForm")],
-    beginButton: new sap.m.Button({ text: "Save", type: "Emphasized", press: function () { _saveOpDialog(); } }),
+    beginButton: new sap.m.Button({ text: "OK", type: "Emphasized", press: function () { _saveOpDialog(); } }),
     endButton:   new sap.m.Button({ text: "Cancel", press: function () { oOpDialog.close(); } })
   });
 
@@ -2935,33 +3027,78 @@ sap.ui.getCore().attachInit(function () {
   var oJobTitleInput = new sap.m.Input({ placeholder: "Job title",   width: "100%" });
   var oJobDescInput  = new sap.m.TextArea({ placeholder: "Job description", width: "100%", rows: 4 });
 
-  function _fillAndOpenJobDialog() {
-    oJobNumInput.setValue(_jobState.job_number).setValueState("None");
-    oJobTitleInput.setValue(_jobState.job_title);
-    oJobDescInput.setValue(_jobState.job_description);
-    oTctDirectInput.setValue(_jobState.target_cycle_time || 60);
-    _machinePanel.setItems(_jobState.machine_list   || []);
-    _robotPanel.setItems(_jobState.robot_list       || []);
-    _operatorPanel.setItems(_jobState.operator_list || []);
-    oPredefModel.setData({ items: JSON.parse(JSON.stringify(_jobState.predefined_processes || [])) });
+  var _jobDialogMode = "edit";
+
+  function openJobDialog(mode) {
+    _jobDialogMode = mode || "edit";
+    if (_jobDialogMode === "add") {
+      oJobNumInput.setValue("").setValueState("None");
+      oJobTitleInput.setValue("");
+      oJobDescInput.setValue("");
+      oTctDirectInput.setValue(60);
+      _machinePanel.setItems([]);
+      _robotPanel.setItems([]);
+      _operatorPanel.setItems([]);
+      oPredefModel.setData({ items: [] });
+      oJobDialog.setTitle("New Job");
+    } else {
+      oJobNumInput.setValue(_jobState.job_number).setValueState("None");
+      oJobTitleInput.setValue(_jobState.job_title);
+      oJobDescInput.setValue(_jobState.job_description);
+      oTctDirectInput.setValue(_jobState.target_cycle_time || 60);
+      _machinePanel.setItems(_jobState.machine_list   || []);
+      _robotPanel.setItems(_jobState.robot_list       || []);
+      _operatorPanel.setItems(_jobState.operator_list || []);
+      oPredefModel.setData({ items: JSON.parse(JSON.stringify(_jobState.predefined_processes || [])) });
+      oJobDialog.setTitle("Edit Job");
+    }
     oJobDialog.open();
   }
 
-  function openJobDialog() {
-    _fillAndOpenJobDialog();
-  }
-
   function _saveJobDialog() {
-    // Capture predefined processes first — before any validation that might return early
     _jobState.predefined_processes = (oPredefModel.getProperty('/items') || [])
       .filter(function (p) { return (p.name || '').trim(); });
 
     var jobNum = oJobNumInput.getValue().trim();
     if (!jobNum) { oJobNumInput.setValueState("Error").setValueStateText("Job # is required"); return; }
     oJobNumInput.setValueState("None");
+
     var tct = _tctDirectMode
       ? oTctDirectInput.getValue()
       : (_planRows[2].spp > 0 ? _planRows[2].spp : oTctDirectInput.getValue());
+
+    if (_jobDialogMode === "add") {
+      if (_projectOpMap.hasOwnProperty(jobNum)) {
+        oJobNumInput.setValueState("Error").setValueStateText('Job "' + jobNum + '" already exists');
+        return;
+      }
+      // Register new empty job first so any change event reads correct data
+      _projectOpMap[jobNum] = [];
+      _opTreeCache       = {};
+      _opMetaMap         = {};
+      _itemsDetailsCache = {};
+      _opsToDelete       = [];
+      oJobSelect.addItem(new sap.ui.core.Item({ key: jobNum, text: jobNum }));
+      oJobSelect.setSelectedKey(jobNum);
+      // Explicitly reset op select and tree — overrides any intermediate state
+      // from a potential change event fired by setSelectedKey
+      _populateOpSelect(jobNum);
+      oDataModel.setData({ items: [], maxCycleEnd: 500 });
+    } else {
+      var prevJobNum = _jobState.job_number;
+      if (prevJobNum && jobNum !== prevJobNum) {
+        if (!window.confirm('Change job number from "' + prevJobNum + '" to "' + jobNum + '"?')) return;
+        // Rename the dropdown item and the map key
+        _projectOpMap[jobNum] = _projectOpMap[prevJobNum] || [];
+        delete _projectOpMap[prevJobNum];
+        var items = oJobSelect.getItems();
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].getKey() === prevJobNum) { items[i].setKey(jobNum); items[i].setText(jobNum); break; }
+        }
+        oJobSelect.setSelectedKey(jobNum);
+      }
+    }
+
     _jobState.job_number        = jobNum;
     _jobState.job_title         = oJobTitleInput.getValue().trim();
     _jobState.job_description   = oJobDescInput.getValue().trim();
@@ -2970,12 +3107,12 @@ sap.ui.getCore().attachInit(function () {
     _jobState.robot_list        = _robotPanel.getItems();
     _jobState.operator_list     = _operatorPanel.getItems();
     oJobDialog.close();
-    recalcTree();
-    sap.m.MessageToast.show("Job saved.");
+    if (_jobDialogMode === "edit") recalcTree();
+    sap.m.MessageToast.show(_jobDialogMode === "add" ? 'Job "' + jobNum + '" created. Add ops and save to persist.' : "Job saved.");
   }
 
   var oJobDialog = new sap.m.Dialog({
-    title: "Job Specifications", contentWidth: "620px", resizable: true, draggable: true,
+    title: "Edit Job", contentWidth: "620px", resizable: true, draggable: true,
     content: [new sap.m.IconTabBar({
       stretchContentHeight: false,
       items: [
@@ -3024,55 +3161,106 @@ sap.ui.getCore().attachInit(function () {
         })
       ]
     })],
-    beginButton: new sap.m.Button({ text: "Save", type: "Emphasized", press: function () { _saveJobDialog(); } }),
+    beginButton: new sap.m.Button({ text: "OK", type: "Emphasized", press: function () { _saveJobDialog(); } }),
     endButton:   new sap.m.Button({ text: "Cancel", press: function () { oJobDialog.close(); } })
   });
+
+  // ── Job Number label (shown between Job button and Op dropdown) ───────────
+  var oJobNumLabel = new sap.m.Text({ text: "", wrapping: false }).addStyleClass("vtJobNumBadge");
+
+  // ── Job Select dropdown ───────────────────────────────────────────────────
+  var oJobSelect = new sap.m.Select({
+    width:       "14rem",
+    forceSelection: false,
+    tooltip:     "Select a project/job from the database",
+    change: function (oEvent) {
+      var key = oEvent.getParameter("selectedItem") && oEvent.getParameter("selectedItem").getKey();
+      if (!key) return;
+      _jobState.job_number = key;
+      _opTreeCache       = {};
+      _opMetaMap         = {};
+      _itemsDetailsCache = {};
+      _opsToDelete       = [];
+      oDataModel.setData({ items: [], maxCycleEnd: 500 });
+      maxCycleEnd = 0;
+      updateGanttColumn();
+      updateRuler();
+      setTimeout(_updateMiniPie, 0);
+      if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
+      _populateOpSelect(key);
+    }
+  });
+  // Placeholder item (shown when nothing is selected)
+  oJobSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select Job…" }));
 
   // ── Job Toolbar ───────────────────────────────────────────────────────────
   var oJobToolbar = new sap.m.Toolbar({
     style: "Standard",
     content: [
-      new sap.m.Button({
-        icon:    "sap-icon://factory",
-        text:    "Job",
-        type:    "Transparent",
-        tooltip: "Edit Job settings (name, target cycle time, machines, robots, operators)",
-        press: function () { openJobDialog(); }
-      }),
-      new sap.m.ToolbarSeparator(),
-      oOpSelect,
-      new sap.m.Button({ icon: "sap-icon://create", type: "Transparent", tooltip: "Add new Operation",
-        press: function () { openOpDialog("add", null); }
-      }),
-      new sap.m.Button({ icon: "sap-icon://edit", type: "Transparent", tooltip: "Edit current Operation settings",
-        press: function () {
-          var op = oOpSelect.getSelectedKey();
-          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
-          openOpDialog("edit", op);
-        }
-      }),
-      new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate current Operation",
-        press: function () { openDupOpDialog(); }
-      }),
-      new sap.m.Button({ icon: "sap-icon://delete", type: "Reject", tooltip: "Delete current Operation",
-        press: function () {
-          var op = oOpSelect.getSelectedKey();
-          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
-          if (!window.confirm('Are you sure you want to delete Op "' + op + '"?\nThis cannot be undone.')) return;
-          _opsToDelete.push(op);
-          var allItems = oOpSelect.getItems();
-          for (var k = 0; k < allItems.length; k++) {
-            if (allItems[k].getKey() === op) { oOpSelect.removeItem(allItems[k]); break; }
-          }
-          sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
-        }
-      }),
-      new sap.m.Button({
-        icon:    "sap-icon://upload-to-cloud",
-        type:    "Transparent",
-        tooltip: "Import Excel file (.xlsx / .xls / .xlsm) — adds stations to current Op (header on row 10, columns: DESCRIPTION, SEC, SEC.1)",
-        press: function () { document.getElementById('vtXlsxInput').click(); }
-      }),
+      new sap.m.HBox({
+        alignItems: "Center",
+        items: [
+          new sap.m.Label({ text: "Job:", labelFor: oJobSelect }),
+          oJobSelect,
+          new sap.m.Button({
+            icon:    "sap-icon://add",
+            type:    "Transparent",
+            tooltip: "Create a new job/project",
+            press: function () { openJobDialog("add"); }
+          }),
+          new sap.m.Button({
+            icon:    "sap-icon://edit",
+            type:    "Transparent",
+            tooltip: "Edit current job settings (name, target cycle time, machines, robots, operators)",
+            press: function () { openJobDialog("edit"); }
+          }),
+          new sap.m.Button({
+            icon:    "sap-icon://delete",
+            type:    "Reject",
+            tooltip: "Delete the selected job/project",
+            press: function () { sap.m.MessageToast.show("Delete Job: not yet implemented."); }
+          })
+        ]
+      }).addStyleClass("vtJobSection"),
+      new sap.m.HBox({
+        alignItems: "Center",
+        items: [
+          new sap.m.Label({ text: "Op/Cell:", labelFor: oOpSelect }),
+          oOpSelect,
+          new sap.m.Button({ icon: "sap-icon://add", type: "Transparent", tooltip: "Add new Operation",
+            press: function () { openOpDialog("add", null); }
+          }),
+          new sap.m.Button({ icon: "sap-icon://edit", type: "Transparent", tooltip: "Edit current Operation settings",
+            press: function () {
+              var op = oOpSelect.getSelectedKey();
+              if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+              openOpDialog("edit", op);
+            }
+          }),
+          new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate current Operation",
+            press: function () { openDupOpDialog(); }
+          }),
+          new sap.m.Button({ icon: "sap-icon://delete", type: "Reject", tooltip: "Delete current Operation",
+            press: function () {
+              var op = oOpSelect.getSelectedKey();
+              if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+              if (!window.confirm('Are you sure you want to delete Op "' + op + '"?\nThis cannot be undone.')) return;
+              _opsToDelete.push(op);
+              var allItems = oOpSelect.getItems();
+              for (var k = 0; k < allItems.length; k++) {
+                if (allItems[k].getKey() === op) { oOpSelect.removeItem(allItems[k]); break; }
+              }
+              sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
+            }
+          }),
+          new sap.m.Button({
+            icon:    "sap-icon://upload-to-cloud",
+            type:    "Transparent",
+            tooltip: "Import Excel file (.xlsx / .xls / .xlsm) — adds stations to current Op (header on row 10, columns: DESCRIPTION, SEC, SEC.1)",
+            press: function () { document.getElementById('vtXlsxInput').click(); }
+          })
+        ]
+      }).addStyleClass("vtOpSection"),
       new sap.m.ToolbarSpacer(),
       new sap.m.ToggleButton({
         icon:    "sap-icon://detail-view",
@@ -3524,10 +3712,33 @@ sap.ui.getCore().attachInit(function () {
     change: function (oEvent) { onCycleConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
   });
 
+  function _rcCycleApplyAndFocus() {
+    oRcCycleValueInput.setValueState(sap.ui.core.ValueState.None);
+    applyRcChange('cycle', RC_COND.CUSTOM_VALUE, [oRcCycleValueInput.getValue()], 0);
+    setTimeout(function () {
+      var rows = oTable.getRows();
+      for (var i = 0; i < rows.length; i++) {
+        var ctx = rows[i].getBindingContext();
+        if (!ctx) continue;
+        var obj = ctx.getObject();
+        if (obj && obj.item_id === oSelectedItemId) {
+          var domRef = rows[i].getDomRef ? rows[i].getDomRef() : null;
+          if (domRef) { domRef.setAttribute('tabindex', '-1'); domRef.focus(); }
+          break;
+        }
+      }
+    }, 0);
+  }
+
   var oRcCycleValueInput = new sap.m.StepInput({
     tooltip: 'Cycle Time (s)', value: 10, min: 0, step: 0.5,
     width: '115px',
-    change: function () { this.setValueState('None'); applyRcChange('cycle', RC_COND.CUSTOM_VALUE, [oRcCycleValueInput.getValue()], 0); }
+    change: function () {
+      // onsapenter already handled apply+focus when Enter was pressed; skip double-apply
+      if (_rcCycleSapEnterDone) { _rcCycleSapEnterDone = false; return; }
+      this.setValueState('None');
+      applyRcChange('cycle', RC_COND.CUSTOM_VALUE, [oRcCycleValueInput.getValue()], 0);
+    }
   });
   oRcCycleValueInput.addEventDelegate({
     onfocusin: function () {
@@ -3538,6 +3749,10 @@ sap.ui.getCore().attachInit(function () {
         if (inp.setCustomValidity) inp.setCustomValidity("");
         setTimeout(function () { inp.select(); }, 0);
       }
+    },
+    onsapenter: function () {
+      _rcCycleSapEnterDone = true;
+      _rcCycleApplyAndFocus();
     }
   });
   var oRcCycleValueRow = new sap.m.HBox({
@@ -3732,16 +3947,11 @@ sap.ui.getCore().attachInit(function () {
     ]
   }).addStyleClass('sapUiSizeCompact vtDesignStatusBar');
 
-  // ── Design Tab: top toolbars fixed, table fills middle, scale bar at bottom ─
+  // ── Design Tab: job toolbar → RC toolbar → scale toolbar → table ────────────
   var oDesignLayout = new sap.ui.layout.FixFlex({
     vertical:    true,
-    fixContent:  [oJobToolbar, oRcToolbar],
-    flexContent: new sap.ui.layout.FixFlex({
-      vertical:    true,
-      fixFirst:    false,
-      fixContent:  [oTreeDesignToolbar],
-      flexContent: oTable
-    })
+    fixContent:  [oJobToolbar, oRcToolbar, oTreeDesignToolbar],
+    flexContent: oTable
   });
 
   // ── Plots / Chart.js ──────────────────────────────────────────────────────
@@ -4018,7 +4228,7 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function _renderJobPlots() {
-    var allOps    = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+    var allOps    = oOpSelect.getItems().map(function (i) { return i.getKey(); }).filter(Boolean);
     var cached    = allOps.filter(function (op) { return !!_opTreeCache[op]; });
     var target    = _jobState.target_cycle_time || 0;
     var noteEl    = document.getElementById('vtJobPlotsNote');
@@ -4063,6 +4273,7 @@ sap.ui.getCore().attachInit(function () {
       var cached = cachedDetails[item.item_id] || {};
       var record = {
         item_id:                  item.item_id,
+        project_number:           _jobState.job_number || '',
         op_number:                opNumber,
         designer_comments:        cached.designer_comments        || null,
         designer_resources_links: cached.designer_resources_links || null,
@@ -4152,7 +4363,7 @@ sap.ui.getCore().attachInit(function () {
     var title = _jobState.job_title         || '—';
     var tct   = parseFloat(_jobState.target_cycle_time) || 0;
     var date  = new Date().toISOString().slice(0, 10);
-    var ops   = oOpSelect.getItems().map(function (it) { return it.getKey(); });
+    var ops   = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
 
     if (!ops.length) {
       content.innerHTML = '<em style="color:#aaa;font-family:72,Arial,sans-serif;font-size:0.82rem;">No ops loaded yet — open the Design tab first.</em>';
@@ -4392,18 +4603,23 @@ sap.ui.getCore().attachInit(function () {
       _opMetaMap[opName]   = {};
       _opTreeCache[opName] = JSON.parse(JSON.stringify(stations));
 
-      // Add op to dropdown
+      // Add op to dropdown and keep _projectOpMap in sync
       oOpSelect.addItem(new sap.ui.core.Item({ key: opName, text: opName }));
+      var _curJob = _jobState.job_number;
+      if (_curJob && _projectOpMap[_curJob] && _projectOpMap[_curJob].indexOf(opName) < 0) {
+        _projectOpMap[_curJob].push(opName);
+      }
 
       // Persist to DB immediately
       fetch(API_BASE + '/updateDB', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
-          cycle_general_structure: stripClientFields(stations),
+          op_number:               opName,
+          cycle_general_structure: stripClientFields(_tagOpNumber(stations, opName)),
           items_details:           _buildItemsDetailsPayload(opName, stations),
           job_metadata:            _buildJobMetadata(opName, stations),
-          op_number:               opName,
+          project_metadata:        _buildProjectMetadata(),
           ops_to_delete:           []
         })
       })
@@ -4426,6 +4642,18 @@ sap.ui.getCore().attachInit(function () {
 
   function _vtParseExcel(file) {
     if (typeof XLSX === 'undefined') { sap.m.MessageToast.show('SheetJS library not loaded.'); return; }
+
+    if (!_jobState.job_number) {
+      var jobNum = window.prompt('No job number is set. Enter a job number to continue with the import:');
+      if (!jobNum || !jobNum.trim()) { sap.m.MessageToast.show('Import cancelled: job number is required.'); return; }
+      jobNum = jobNum.trim();
+      _jobState.job_number = jobNum;
+      if (!_projectOpMap.hasOwnProperty(jobNum)) {
+        _projectOpMap[jobNum] = [];
+        oJobSelect.addItem(new sap.ui.core.Item({ key: jobNum, text: jobNum }));
+      }
+      oJobSelect.setSelectedKey(jobNum);
+    }
 
     var reader = new FileReader();
     reader.onload = function (e) {
@@ -4502,16 +4730,10 @@ sap.ui.getCore().attachInit(function () {
   // ── More Spec dialog ─────────────────────────────────────────────────────────
 
   function _msSave(itemId, op, fields) {
-    var payload = Object.assign({ item_id: itemId, op_number: op }, fields);
-    // update in-memory cache immediately
+    // Only update in-memory cache; data is persisted to DB when the main Save button is clicked.
     var cache = _itemsDetailsCache[op] || (_itemsDetailsCache[op] = {});
     if (!cache[itemId]) cache[itemId] = {};
     Object.assign(cache[itemId], fields);
-    fetch(API_BASE + '/api/more_spec', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload)
-    }).catch(function (err) { console.warn('[vtMoreSpec] save error:', err.message); });
   }
 
   function _msDebounce(fn, ms) {
@@ -4637,6 +4859,7 @@ sap.ui.getCore().attachInit(function () {
   function _openMoreSpecDialog(item) {
     var op      = oOpSelect.getSelectedKey();
     var details = ((_itemsDetailsCache[op] || {})[item.item_id]) || {};
+    console.log('[vtMoreSpec] opening for item_id:', item.item_id, 'op:', op, '— details from cache:', JSON.parse(JSON.stringify(details)));
 
     var oIconTab = new sap.m.IconTabBar({
       stretchContentHeight: true,
@@ -4659,6 +4882,7 @@ sap.ui.getCore().attachInit(function () {
       draggable:     true,
       resizable:     true,
       content:       [new sap.m.ScrollContainer({ vertical: true, horizontal: false, height: '100%', content: [oIconTab] })],
+      beginButton:   new sap.m.Button({ text: 'OK', type: 'Emphasized', press: function () { oDialog.close(); } }),
       endButton:     new sap.m.Button({ text: 'Close', press: function () { oDialog.close(); } }),
       afterClose:    function () { oDialog.destroy(); }
     });
@@ -4705,7 +4929,7 @@ sap.ui.getCore().attachInit(function () {
 
   function _renderStatsTab() {
     _renderReportTable();
-    var ops        = oOpSelect.getItems().map(function (it) { return it.getKey(); });
+    var ops        = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
     var target     = _jobState.target_cycle_time || 0;
     var opSections = document.getElementById('vtStatsOpSections');
     if (!opSections) return;
@@ -4786,7 +5010,7 @@ sap.ui.getCore().attachInit(function () {
     if (!content) return;
     var st = document.getElementById('vtRptStatus');
     if (st) st.style.display = 'none';
-    var ops      = oOpSelect.getItems().map(function (it) { return it.getKey(); });
+    var ops      = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
     var uncached = ops.filter(function (op) { return !_opTreeCache[op]; });
     if (!uncached.length) {
       _renderStatsTab();
@@ -4939,7 +5163,14 @@ sap.ui.getCore().attachInit(function () {
     if (e.key === 'Escape') {
       if (oRcState.waitPhase) { cancelRcWait(); }
       else { clearRowHighlight(); }
+      return;
     }
+    // Suppress all other shortcuts when focus is inside a text-entry element
+    var t = e.target;
+    var inInput = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+                        t.isContentEditable || t.closest('[contenteditable="true"]'));
+    if (inInput) return;
+    if (e.key === 'Delete') { e.preventDefault(); removeProcess(); return; }
     if (e.shiftKey && e.key === 'P') { e.preventDefault(); addNewProcess(); return; }
     var mod = e.ctrlKey || e.metaKey;
     if (mod && e.key === 'c') { e.preventDefault(); copyToClipboard(); }
@@ -5014,10 +5245,9 @@ sap.ui.getCore().attachInit(function () {
     });
   }());
 
-  // Initial ruler render, then load data
-  // _jobState is populated from project_metadata arriving in the /updateTree response
+  // Initial ruler render, then fetch project list (which auto-loads the first project)
   updateRuler();
-  loadOpNumbers();
+  loadProjectList();
 });
 </script>
 </body>

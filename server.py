@@ -456,6 +456,10 @@ def api_tree():
 @app.route("/updateDB", methods=["POST"])
 def api_update_db():
     data       = request.get_json() or {}
+    import json as _json
+    print("[updateDB] payload keys:", list(data.keys()))
+    print("[updateDB] job_metadata:", _json.dumps(data.get("job_metadata"), indent=2))
+    print("[updateDB] items_details sample:", _json.dumps((data.get("items_details") or [])[:2], indent=2))
     updated_db = data.get("cycle_general_structure", data.get("updated_db", []))
     op_number  = data.get("op_number", "")
 
@@ -515,17 +519,22 @@ def api_update_db():
             conn.close()
 
     # Flatten nested tree → flat list of DB records
+    project_number = str((proj_meta or {}).get("project_no") or "")
     flat = []
     def flatten(items):
         for item in (items or []):
-            flat.append({k: v for k, v in item.items()
-                         if k not in ("sub_process_items", "nodes", "_ancestorEnds")})
+            rec = {k: v for k, v in item.items()
+                   if k not in ("sub_process_items", "nodes", "_ancestorEnds")}
+            if project_number:
+                rec["project_number"] = project_number
+            flat.append(rec)
             flatten(item.get("sub_process_items") or item.get("nodes") or [])
     flatten(updated_db)
 
     if DB_PATH and os.path.exists(DB_PATH):
         conn = sqlite3.connect(DB_PATH)
         cur  = conn.cursor()
+        _ensure_project_number_col(conn)
 
         # Discover existing columns; auto-add any new ones from the payload
         cur.execute(f"PRAGMA table_info({TABLE_NAME})")
@@ -547,10 +556,16 @@ def api_update_db():
                 continue
             set_clause = ", ".join(c + " = ?" for c in cols)
             values     = [record[c] for c in cols] + [item_id]
-            cur.execute(
-                "UPDATE " + TABLE_NAME + " SET " + set_clause + " WHERE item_id = ?",
-                values
-            )
+            try:
+                cur.execute(
+                    "UPDATE " + TABLE_NAME + " SET " + set_clause + " WHERE item_id = ?",
+                    values
+                )
+            except sqlite3.IntegrityError as e:
+                print(f"[updateDB] IntegrityError on item_id={item_id}: {e}")
+                print(f"[updateDB] cols={cols}")
+                print(f"[updateDB] values={values}")
+                raise
         conn.commit()
         conn.close()
     else:
@@ -576,13 +591,82 @@ def api_update_op_numbers():
 
 @app.route("/updateTree", methods=["POST"])
 def api_update_tree():
-    data    = request.get_json() or {}
-    op      = data.get("op_number", "")
+    data           = request.get_json() or {}
+    op             = data.get("op_number", "")
+    project_number = data.get("project_number", "")
+
+    # ── Project-level load (no op_number supplied) ────────────────────────────
+    if not op and (project_number is not None):
+        ops_data      = {}
+        items_details = []
+        proj_meta     = {}
+
+        if DB_PATH and os.path.exists(DB_PATH):
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            _ensure_project_number_col(conn)
+            _ensure_items_details_table(conn)
+            _ensure_project_metadata_table(conn)
+
+            if not project_number:
+                row = conn.execute("SELECT project_no FROM project_metadata LIMIT 1").fetchone()
+                if row:
+                    project_number = row["project_no"]
+
+            if project_number:
+                records = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM {TABLE_NAME} WHERE project_number=?", (project_number,)
+                )]
+            else:
+                records = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_NAME}")]
+
+            for rec in records:
+                ops_data.setdefault(rec.get("op_number") or "", []).append(rec)
+
+            item_ids = [r["item_id"] for r in records if r.get("item_id")]
+            if item_ids:
+                ph = ",".join("?" * len(item_ids))
+                items_details = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM items_details WHERE item_id IN ({ph})", item_ids
+                )]
+
+            row = conn.execute(
+                "SELECT * FROM project_metadata WHERE project_no=?", (project_number,)
+            ).fetchone() if project_number else \
+                conn.execute("SELECT * FROM project_metadata LIMIT 1").fetchone()
+            proj_meta = dict(row) if row else JOB_METADATA
+            conn.close()
+        else:
+            for rec in SAMPLE_DATA:
+                ops_data.setdefault(rec.get("op_number") or "", []).append(rec)
+            for op_list in ITEMS_DETAILS.values():
+                items_details.extend(op_list)
+            proj_meta = JOB_METADATA
+
+        ops_trees   = {op: build_tree(recs) for op, recs in ops_data.items()}
+        op_meta_out = {
+            op: {
+                "op_title":       OP_METADATA.get(op, {}).get("op_title", ""),
+                "op_description": OP_METADATA.get(op, {}).get("op_description", ""),
+                "num_of_parts":   OP_METADATA.get(op, {}).get("num_of_parts", 1),
+            }
+            for op in ops_data
+        }
+        return jsonify({
+            "data": {
+                "op_numbers":       sorted(ops_data.keys()),
+                "ops":              ops_trees,
+                "op_metadata":      op_meta_out,
+                "items_details":    items_details,
+                "project_metadata": [proj_meta] if proj_meta else [],
+            }
+        })
+
+    # ── Single-op load (existing behaviour) ───────────────────────────────────
     records = get_records(op)
     tree    = build_tree(records)
     max_end = max((r.get("cycle_end") or 0.0 for r in records), default=0.0)
 
-    # items_details for this op
     if DB_PATH and os.path.exists(DB_PATH):
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -595,7 +679,6 @@ def api_update_tree():
     else:
         items_details = list(ITEMS_DETAILS.get(op, []))
 
-    # op metadata row (client reads op_number, op_title, job_description, num_of_parts)
     op_meta = OP_METADATA.get(op, {})
     op_meta_rows = [{
         "op_number":       op,
@@ -604,15 +687,23 @@ def api_update_tree():
         "num_of_parts":    op_meta.get("num_of_parts", 1),
     }] if op else []
 
-    # project_metadata: prefer DB row, fall back to in-memory JOB_METADATA
     if DB_PATH and os.path.exists(DB_PATH):
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         _ensure_project_metadata_table(conn)
+        _ensure_project_number_col(conn)
         cur = conn.cursor()
-        cur.execute("SELECT * FROM project_metadata LIMIT 1")
-        proj_row = cur.fetchone()
-        conn.commit()
+        # Look up which project this op belongs to, then fetch that project's metadata
+        op_row = cur.execute(
+            f"SELECT project_number FROM {TABLE_NAME} WHERE op_number=? LIMIT 1", (op,)
+        ).fetchone()
+        proj_no = op_row["project_number"] if op_row and op_row["project_number"] else None
+        if proj_no:
+            proj_row = cur.execute(
+                "SELECT * FROM project_metadata WHERE project_no=?", (proj_no,)
+            ).fetchone()
+        else:
+            proj_row = cur.execute("SELECT * FROM project_metadata LIMIT 1").fetchone()
         conn.close()
         project_meta_rows = [dict(proj_row)] if proj_row else [JOB_METADATA]
     else:
@@ -814,6 +905,14 @@ def _ensure_project_metadata_table(conn):
 
 def _ensure_items_details_table(conn):
     conn.execute(_ITEMS_DETAILS_SCHEMA)
+
+
+def _ensure_project_number_col(conn):
+    """Migrate cycle_general_structure to add project_number column if missing."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_NAME})")}
+    if "project_number" not in existing:
+        conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN project_number TEXT DEFAULT ''")
+        conn.commit()
     # Migrate: add columns introduced after the initial schema
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(items_details)")}
     for col, defn in [
@@ -854,15 +953,34 @@ def api_save_items_details():
             item_id = rec.get("item_id")
             if not item_id:
                 continue
-            cur.execute(
-                "UPDATE items_details SET "
-                "op_number=?, machine_cycle_time_summary=?, "
-                "total_machine_cycle=?, total_manual_cycle=?, "
-                "total_robot_cycle=?, total_operator_cycle=?, "
-                "used_cycle_time=?, num_of_parts=? "
-                "WHERE item_id=?",
-                (
-                    op_number,
+            vals_update = (
+                op_number,
+                rec.get("machine_cycle_time_summary", "{}"),
+                rec.get("total_machine_cycle", 0.0),
+                rec.get("total_manual_cycle",  0.0),
+                rec.get("total_robot_cycle",   0.0),
+                rec.get("total_operator_cycle",0.0),
+                rec.get("used_cycle_time",     0.0),
+                rec.get("num_of_parts",        1),
+                item_id,
+            )
+            try:
+                cur.execute(
+                    "UPDATE items_details SET "
+                    "op_number=?, machine_cycle_time_summary=?, "
+                    "total_machine_cycle=?, total_manual_cycle=?, "
+                    "total_robot_cycle=?, total_operator_cycle=?, "
+                    "used_cycle_time=?, num_of_parts=? "
+                    "WHERE item_id=?",
+                    vals_update
+                )
+            except sqlite3.IntegrityError as e:
+                print(f"[items_details] IntegrityError UPDATE item_id={item_id}: {e}")
+                print(f"[items_details] values={vals_update}")
+                raise
+            if cur.rowcount == 0:
+                vals_insert = (
+                    item_id, op_number,
                     rec.get("machine_cycle_time_summary", "{}"),
                     rec.get("total_machine_cycle", 0.0),
                     rec.get("total_manual_cycle",  0.0),
@@ -870,27 +988,20 @@ def api_save_items_details():
                     rec.get("total_operator_cycle",0.0),
                     rec.get("used_cycle_time",     0.0),
                     rec.get("num_of_parts",        1),
-                    item_id,
                 )
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    "INSERT INTO items_details "
-                    "(item_id, op_number, machine_cycle_time_summary, "
-                    "total_machine_cycle, total_manual_cycle, total_robot_cycle, "
-                    "total_operator_cycle, used_cycle_time, num_of_parts) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        item_id, op_number,
-                        rec.get("machine_cycle_time_summary", "{}"),
-                        rec.get("total_machine_cycle", 0.0),
-                        rec.get("total_manual_cycle",  0.0),
-                        rec.get("total_robot_cycle",   0.0),
-                        rec.get("total_operator_cycle",0.0),
-                        rec.get("used_cycle_time",     0.0),
-                        rec.get("num_of_parts",        1),
+                try:
+                    cur.execute(
+                        "INSERT INTO items_details "
+                        "(item_id, op_number, machine_cycle_time_summary, "
+                        "total_machine_cycle, total_manual_cycle, total_robot_cycle, "
+                        "total_operator_cycle, used_cycle_time, num_of_parts) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        vals_insert
                     )
-                )
+                except sqlite3.IntegrityError as e:
+                    print(f"[items_details] IntegrityError INSERT item_id={item_id}: {e}")
+                    print(f"[items_details] values={vals_insert}")
+                    raise
         conn.commit()
         conn.close()
     else:
