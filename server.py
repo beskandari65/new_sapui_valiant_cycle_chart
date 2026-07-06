@@ -589,6 +589,62 @@ def api_update_op_numbers():
     return jsonify({"data": get_op_numbers()})
 
 
+@app.route("/updateProjectNumbers", methods=["POST"])
+def api_update_project_numbers():
+    """Return op lists and project metadata keyed by project_number."""
+    op_numbers_map   = {}   # { project_number: [op1, op2, ...] }
+    project_meta_map = {}   # { project_number: { project_no, project_title, target_cycle_time, ... } }
+
+    if DB_PATH and os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        _ensure_project_number_col(conn)
+        _ensure_project_metadata_table(conn)
+
+        rows = conn.execute(
+            f"SELECT DISTINCT project_number, op_number FROM {TABLE_NAME} "
+            f"WHERE project_number IS NOT NULL AND project_number != '' "
+            f"ORDER BY project_number, op_number"
+        ).fetchall()
+        for row in rows:
+            pn = row["project_number"]
+            op = row["op_number"]
+            op_numbers_map.setdefault(pn, [])
+            if op and op not in op_numbers_map[pn]:
+                op_numbers_map[pn].append(op)
+
+        if op_numbers_map:
+            proj_nos = list(op_numbers_map.keys())
+            ph = ",".join("?" * len(proj_nos))
+            for row in conn.execute(
+                f"SELECT * FROM project_metadata WHERE project_no IN ({ph})", proj_nos
+            ).fetchall():
+                project_meta_map[row["project_no"]] = dict(row)
+
+        conn.close()
+    else:
+        seen = set()
+        for r in SAMPLE_DATA:
+            op = r.get("op_number")
+            pn = r.get("project_number") or "default"
+            if op and op not in seen:
+                seen.add(op)
+                op_numbers_map.setdefault(pn, [])
+                op_numbers_map[pn].append(op)
+        for op in OP_NUMBERS:
+            if op not in seen:
+                op_numbers_map.setdefault("default", []).append(op)
+        for pn in op_numbers_map:
+            project_meta_map[pn] = dict(JOB_METADATA, project_no=pn)
+
+    return jsonify({
+        "data": {
+            "op_numbers":       op_numbers_map,
+            "project_metadata": project_meta_map,
+        }
+    })
+
+
 @app.route("/updateTree", methods=["POST"])
 def api_update_tree():
     data           = request.get_json() or {}

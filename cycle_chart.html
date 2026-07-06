@@ -143,11 +143,26 @@
     /* Job number badge in the job toolbar */
     .vtJobNumBadge.sapMText { font-weight:700; font-size:0.82rem; color:#0854a0; padding:1px 6px; letter-spacing:0.01em; }
 
-    /* Job / Op section pills inside the job toolbar */
+    /* Job / Op section pills (toolbar and page header) */
     .vtJobSection, .vtOpSection { display:flex !important; align-items:center !important; padding:2px 6px 2px 6px !important; border-radius:5px; gap:2px; }
-    .vtJobSection { background:rgba(8,84,160,0.13); border: 1px solid rgba(8,84,160,0.22); }
+    .vtJobSection { background:rgba(8,84,160,0.13); border: 1px solid rgba(8,84,160,0.22); margin-right:6px; }
     .vtOpSection  { background:rgba(200,100,0,0.10); border: 1px solid rgba(200,100,0,0.22); }
     .vtJobSection .sapMLabel, .vtOpSection .sapMLabel { font-weight:600; font-size:0.8rem; color:#444; padding-right:2px; white-space:nowrap; }
+
+    /* Page header bar — compact controls + title */
+    .vtPageHeaderBar { height:auto !important; min-height:2.75rem; }
+    .vtPageHeaderBar.sapMBar { flex-wrap:nowrap; overflow:hidden; }
+    .vtPageHeaderBar .sapMBarLeft { overflow:visible; flex-shrink:1; min-width:0; }
+    .vtPageHeaderBar .sapMBtn { min-height:1.75rem; height:1.75rem !important; line-height:1.75rem; }
+    .vtPageHeaderBar .sapMBtnIcon { font-size:0.85rem; }
+    .vtPageHeaderBar .sapMSlt { height:1.75rem !important; min-height:1.75rem; line-height:1.75rem; }
+    .vtPageHeaderBar .sapMSltLabel { line-height:1.75rem; }
+    .vtPageTitle.sapMText { font-size:0.82rem; font-weight:600; color:#32363a; margin-right:10px; white-space:nowrap; }
+
+    /* Tab-bar right-side controls — compact sizing to fit the tab header row */
+    .sapMITBHead .sapMBtn { min-height:2rem; height:2rem !important; }
+    .sapMITBHead .sapMBtnIcon { font-size:0.9rem; }
+    .sapMITBHead .sapMTBSeparator { height:1.25rem; margin:0 4px; }
 
   </style>
 </head>
@@ -163,14 +178,15 @@ sap.ui.getCore().attachInit(function () {
 
   var scaleFactor = 2.0;   // pixels per second
   var maxCycleEnd = 500;   // updated after each API call
-  var nAutoExpandLevel = 0;
+  var nAutoExpandLevel     = 0;
+  var nHomeAutoExpandLevel = 0;
 
   var _opsToDelete = [];  // ops queued for deletion, flushed on saveToDb
 
   // In-memory metadata — no server calls until the Save button is pressed
   var _jobState = {
     job_number: "", job_title: "", job_description: "",
-    target_cycle_time: 60,
+    target_cycle_time: "",
     machine_list: [], robot_list: [], operator_list: [],
     predefined_processes: []
   };
@@ -178,9 +194,12 @@ sap.ui.getCore().attachInit(function () {
   var _opTreeCache      = {}; // opNumber → deep copy of tree items
   var _itemsDetailsCache = {}; // opNumber → array of station stat rows (from items_details table)
   var _projectOpMap     = {}; // projectNumber → [opNumbers] — populated from /updateProjectNumbers
+  var _projectMetaMap   = {}; // projectNumber → project_metadata object — populated from /updateProjectNumbers
   var _suppressOpChange      = false; // prevent oOpSelect.change from firing during programmatic repopulation
+  var _suppressJobChange     = false; // prevent oJobSelect.change re-entry when reverting dropdown on Cancel
   var _rcCycleSapEnterDone   = false; // prevents double-apply when Enter is pressed in cycle-time StepInput
-  var _lastCellClickTime = 0; // for double-click detection on tree rows
+  var _lastCellClickTime     = 0; // for double-click detection on Design tab tree rows
+  var _lastHomeCellClickTime = 0; // for double-click detection on Home tab tree rows
 
   var clipboard = { items: [], mode: 'copy' };
 
@@ -531,7 +550,15 @@ sap.ui.getCore().attachInit(function () {
   // ── Main recalc entry point (mirrors cal_and_update_run_config_values_in_db)
   function recalcTree() {
     var items = oDataModel.getProperty("/items");
-    if (!items || !items.length) return;
+    if (!items || !items.length) {
+      maxCycleEnd = 0;
+      updateGanttColumn();
+      updateRuler();
+      oDataModel.refresh(true);
+      _updateMiniPie();
+      _cacheCurrentOp();
+      return;
+    }
 
     var flatMap = buildFlatMap(items, {});
 
@@ -554,6 +581,7 @@ sap.ui.getCore().attachInit(function () {
     oDataModel.refresh(true);
     _updateMiniPie();
     _updateResourceUsageInCache(oOpSelect.getSelectedKey());
+    _cacheCurrentOp();
     setTimeout(function () { var cur = getCurrentItem(); if (cur) _showRcSigns(cur); }, 0);
   }
 
@@ -743,10 +771,13 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function applyRowHighlight() {
-    oTable.getRows().forEach(function (oRow, i) {
-      var oCtx = oRow.getBindingContext();
-      var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
-      _stampRowClass(oRow, i, 'vtSelectedRow', !!(id && oRcState.activeItemIds.indexOf(id) >= 0));
+    [oTable, oHomeTable].forEach(function (tbl) {
+      if (!tbl) return;
+      tbl.getRows().forEach(function (oRow, i) {
+        var oCtx = oRow.getBindingContext();
+        var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
+        _stampRowClass(oRow, i, 'vtSelectedRow', !!(id && oRcState.activeItemIds.indexOf(id) >= 0));
+      });
     });
   }
 
@@ -766,10 +797,13 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function applyWaitHighlights() {
-    oTable.getRows().forEach(function (oRow, i) {
-      var oCtx = oRow.getBindingContext();
-      var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
-      _stampRowClass(oRow, i, 'vtWaitSelectedRow', !!(id && oRcWaitSelectedIds.indexOf(id) >= 0));
+    [oTable, oHomeTable].forEach(function (tbl) {
+      if (!tbl) return;
+      tbl.getRows().forEach(function (oRow, i) {
+        var oCtx = oRow.getBindingContext();
+        var id = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
+        _stampRowClass(oRow, i, 'vtWaitSelectedRow', !!(id && oRcWaitSelectedIds.indexOf(id) >= 0));
+      });
     });
   }
 
@@ -1258,7 +1292,7 @@ sap.ui.getCore().attachInit(function () {
 
     oSelectedItemId        = freshClones[freshClones.length - 1].item_id;
     oRcState.activeItemIds = freshClones.map(function (c) { return c.item_id; });
-    nAutoExpandLevel = 5;
+    nAutoExpandLevel = 5; nHomeAutoExpandLevel = 5;
     recalcTree();
     sap.m.MessageToast.show("Pasted " + freshClones.length + " item(s)");
   }
@@ -1921,7 +1955,116 @@ sap.ui.getCore().attachInit(function () {
     } catch (e) {}
   }
 
+  // ── Item Details panel (Home tab double-click) ───────────────────────────
+  var _oItemDetailsDialog = null;
+  var _oItemDetailsHtml   = null;
+
+  function _findItemById(items, id) {
+    for (var i = 0; i < (items || []).length; i++) {
+      if (items[i].item_id === id) return items[i];
+      var hit = _findItemById(items[i].sub_process_items, id);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function _buildItemDetailsHtml(item, details) {
+    var esc = function (s) {
+      return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    };
+    var step      = esc(item.step       || '');
+    var title     = esc(item.title      || '');
+    var cycleType = esc(item.cycle_type || '');
+    var start     = item.cycle_start != null ? item.cycle_start : '';
+    var end_      = item.cycle_end   != null ? item.cycle_end   : '';
+    var ct        = item.cycle_time  != null ? item.cycle_time  : '';
+    var comments  = esc(details.designer_comments || '');
+    var rawLinks  = details.designer_resources_links || '';
+
+    var linksHtml = rawLinks
+      ? rawLinks.split('\n').filter(Boolean).map(function (l) {
+          var safe = esc(l);
+          return '<p class="vtDi-ans"><a href="' + safe + '" target="_blank">' + safe + '</a></p>';
+        }).join('')
+      : '<p class="vtDi-ans">No links available</p>';
+
+    var commentsHtml = comments
+      ? '<p><i>' + comments + '</i></p>'
+      : '<p class="vtDi-ans">No comments available</p>';
+
+    // HTML fragment only — no html/head/body wrappers (not valid inside innerHTML)
+    return '<div class="vtDi-wrap">'
+      + '<style>'
+      + '.vtDi-wrap{color:#111;font-family:Arial,sans-serif;padding:16px;background:#f8f9fa;}'
+      + '.vtDi-h1{font-size:1.3rem;font-weight:bold;margin:0 0 12px;}'
+      + '.vtDi-h2{color:darkblue;font-size:1.1rem;font-weight:bold;margin:14px 0 6px;}'
+      + '.vtDi-h4{color:darkgreen;font-size:0.9rem;font-weight:bold;margin:10px 0 4px;}'
+      + '.vtDi-wrap table{border-collapse:collapse;width:100%;margin-top:10px;}'
+      + '.vtDi-wrap td{border:1px solid #ccc;padding:8px 12px;}'
+      + '.vtDi-wrap tr:nth-child(even){background:#eee;}'
+      + '.vtDi-wrap p{margin:4px 0;}'
+      + '.vtDi-wrap a{color:#2c3e50;text-decoration:none;}'
+      + '.vtDi-wrap a:hover{text-decoration:underline;}'
+      + '.vtDi-ans{font-style:italic;}'
+      + '</style>'
+      + '<p class="vtDi-h1">' + step + ' - ' + title + '</p>'
+      + '<table>'
+      + '<tr><td><b>Cycle Type</b></td><td><i>' + cycleType + '</i></td></tr>'
+      + '<tr><td><b>Start Time (s)</b></td><td><i>' + start + '</i></td></tr>'
+      + '<tr><td><b>End Time (s)</b></td><td><i>' + end_ + '</i></td></tr>'
+      + '<tr><td><b>Cycle Time (s)</b></td><td><i>' + ct + '</i></td></tr>'
+      + '</table>'
+      + '<p class="vtDi-h2">Mechanical Design:</p>'
+      + '<p class="vtDi-h4">Comments:</p>'
+      + commentsHtml
+      + '<p class="vtDi-h4">Links:</p>'
+      + linksHtml
+      + '<p class="vtDi-h4">Pictures:</p>'
+      + '<p class="vtDi-ans">No images available</p>'
+      + '</div>';
+  }
+
+  function _showItemDetails(itemId) {
+    var items   = oDataModel.getProperty('/items') || [];
+    var item    = _findItemById(items, itemId);
+    if (!item) return;
+    var op      = oOpSelect.getSelectedKey();
+    var details = (_itemsDetailsCache[op] || {})[itemId] || {};
+
+    if (!_oItemDetailsDialog) {
+      _oItemDetailsHtml = new sap.ui.core.HTML({ sanitizeContent: false });
+      _oItemDetailsDialog = new sap.m.Dialog({
+        contentWidth:  '640px',
+        contentHeight: '72vh',
+        resizable: true,
+        draggable: true,
+        content: [new sap.m.ScrollContainer({
+          vertical: true, horizontal: false, height: '100%',
+          content: [_oItemDetailsHtml]
+        })],
+        endButton: new sap.m.Button({
+          text: 'Close',
+          press: function () { _oItemDetailsDialog.close(); }
+        })
+      });
+    }
+
+    var html = _buildItemDetailsHtml(item, details);
+    var dom  = _oItemDetailsHtml.getDomRef();
+    if (dom) { dom.innerHTML = html; } else { _oItemDetailsHtml.setContent(html); }
+
+    _oItemDetailsDialog.setTitle((item.step || '') + ' — ' + (item.title || ''));
+    _oItemDetailsDialog.open();
+  }
+
   window.__vtOnItemDblClick = function (sId, onAfterCommit) {
+    if (oIconTabBar && oIconTabBar.getSelectedKey() === 'home') {
+      var oCtrl = sap.ui.getCore().byId(sId);
+      var oCtx  = oCtrl && oCtrl.getBindingContext();
+      var itemId = oCtx && oCtx.getObject() && oCtx.getObject().item_id;
+      if (itemId) _showItemDetails(itemId);
+      return;
+    }
     var oCtrl = sap.ui.getCore().byId(sId);
     if (!oCtrl) return;
     var oCtx = oCtrl.getBindingContext();
@@ -2438,13 +2581,394 @@ sap.ui.getCore().attachInit(function () {
     _lastCellClickTime = now;
   });
 
+  // ── Home tab: read-only tree (same model, no editing) ─────────────────────
+  var oHomeRulerHtml  = new sap.ui.core.HTML({ sanitizeContent: false,
+    content: buildRulerHtml(scaleFactor, maxCycleEnd) });
+
+  var oHomeGanttColumn = new sap.ui.table.Column({
+    label:     oHomeRulerHtml,
+    template:  new CycleBar({
+                 cycleStart:   "{cycle_start}",
+                 cycleTime:    "{cycle_time}",
+                 color:        "{color}",
+                 scaleFactor:  "{settings>/scaleFactor}",
+                 cycleType:    "{cycle_type}",
+                 ancestorEnds: "{_ancestorEnds}",
+                 itemId:       "{item_id}"
+               }),
+    width:     (Math.ceil(scaleFactor * maxCycleEnd) + 50) + "px",
+    resizable: false
+  });
+
+  var oHomeTable = new sap.ui.table.TreeTable({
+    visibleRowCountMode: sap.ui.table.VisibleRowCountMode.Auto,
+    minAutoRowCount:     5,
+    selectionMode:       sap.ui.table.SelectionMode.None,
+    alternateRowColors:  true,
+    columnHeaderHeight:  32,
+    rowHeight:           36,
+    fixedColumnCount:    1,
+    columns: [
+      new sap.ui.table.Column({
+        label:     new sap.m.Label({ text: "Cycle Description" }),
+        template:  new TitleCell({
+                     title: {
+                       parts:     [{ path: "step" }, { path: "title" }],
+                       formatter: function (step, title) {
+                         return (step ? step + " > " : "") + (title || "");
+                       }
+                     },
+                     rawTitle:  "{title}",
+                     step:      "{step}",
+                     cycleType: "{cycle_type}",
+                     color:     "{color}"
+                   }),
+        width:     "220px",
+        resizable: true
+      }),
+      oHomeGanttColumn,
+      new sap.ui.table.Column({
+        label:     new sap.m.Label({ text: "Cycle Start (s)" }),
+        template:  new sap.m.Text({
+                     text: { path: "cycle_start",
+                             formatter: function (v) { return v != null ? (+v).toFixed(2) : ""; } },
+                     wrapping: false, textAlign: "End"
+                   }),
+        width: "90px", hAlign: "End", resizable: true
+      }),
+      new sap.ui.table.Column({
+        label:     new sap.m.Label({ text: "Cycle Time (s)" }),
+        template:  new sap.m.Text({
+                     text: { path: "cycle_time",
+                             formatter: function (v) { return v != null ? (+v).toFixed(2) : ""; } },
+                     wrapping: false, textAlign: "End"
+                   }),
+        width: "90px", hAlign: "End", resizable: true
+      }),
+      new sap.ui.table.Column({
+        label:     new sap.m.Label({ text: "Cycle End (s)" }),
+        template:  new sap.m.Text({
+                     text: { path: "cycle_end",
+                             formatter: function (v) { return v != null ? (+v).toFixed(2) : ""; } },
+                     wrapping: false, textAlign: "End"
+                   }),
+        width: "90px", hAlign: "End", resizable: true
+      }),
+      new sap.ui.table.Column({
+        label:    new sap.m.Label({ text: "Cycle Time Details" }),
+        template: new sap.m.FormattedText({
+          htmlText: {
+            parts: [{ path: 'run_cond_config' }, { path: 'parent_id' }],
+            formatter: function (rcStr, parentId) {
+              var T  = '#0854a0';
+              var rc = parseRC(rcStr);
+              if (!rc.cycle) return '-';
+              var cond   = rc.cycle.condition;
+              var vals   = rc.cycle.values || [];
+              var hasVal = vals.length > 0 && String(vals[0]).trim() !== '';
+              var valStr = vals.join(', ');
+              if (hasVal) {
+                if (cond === RC_COND.EQUAL_TO) {
+                  var refId   = vals[vals.length - 1];
+                  var flatMap = buildFlatMap(oDataModel.getProperty('/items'), {});
+                  var ref     = flatMap[refId];
+                  if (!ref) return '<span style="color:red"><strong>' + cond + '</strong>: <em>not found</em></span>';
+                  return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + (ref.step || refId) + '</em></span>';
+                }
+                if (cond === RC_COND.CUSTOM_VALUE) {
+                  return '<span style="color:red"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
+                }
+                if (cond === RC_COND.CYCLE_CALC) {
+                  return '<span style="color:' + T + '"><em>' + valStr + '</em></span>';
+                }
+                if (cond === RC_COND.PREDEFINED) {
+                  var pdName  = vals[0] || '';
+                  var pdFound = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pdName; })[0];
+                  if (!pdFound) return '<span style="color:red"><strong>Predefined</strong>: <em>' + pdName + ' (not found)</em></span>';
+                  return '<span style="color:' + T + '"><strong>Predefined</strong>: <em>' + pdName + '</em></span>';
+                }
+                return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
+              }
+              if (cond) {
+                if (cond === RC_COND.SUBPROCESS && !parentId) return '<em>Station</em>';
+                return '<em>' + cond + '</em>';
+              }
+              return '-';
+            }
+          }
+        }),
+        width: "240px", resizable: true
+      })
+    ]
+  });
+
+  oHomeTable.setModel(oDataModel);
+  oHomeTable.setModel(oSettingsModel, "settings");
+  oHomeTable.bindRows({ path: "/items", parameters: { arrayNames: ["sub_process_items"] } });
+
+  oHomeTable.attachRowsUpdated(function () {
+    if (nHomeAutoExpandLevel > 0) {
+      var lvl = nHomeAutoExpandLevel;
+      nHomeAutoExpandLevel = 0;
+      oHomeTable.expandToLevel(lvl);
+    }
+    if (oRcState.activeItemIds.length) {
+      applyRowHighlight();
+      if (oRcState.activeItemIds.length === 1) { _showRcSigns(getCurrentItem()); }
+    }
+  });
+
+  // Double-click a Home tab bar → show item details dialog
+  oHomeTable.attachCellClick(function (oEvent) {
+    var now = Date.now();
+    if (now - _lastHomeCellClickTime < 380) {
+      var rowIdx = oEvent.getParameter('rowIndex');
+      if (rowIdx < 0) return;
+      var ctx = oHomeTable.getContextByIndex(rowIdx);
+      if (!ctx) return;
+      var item = ctx.getObject();
+      if (!item || !item.item_id) return;
+      var cellDom = oEvent.getParameter('cellDomRef');
+      if (cellDom && cellDom.querySelector('.vtCycleBarRoot')) {
+        _showItemDetails(item.item_id);
+      }
+    }
+    _lastHomeCellClickTime = now;
+  });
+
+  // ── Home tab header ────────────────────────────────────────────────────────
+  var oHomeHeaderHtml = new sap.ui.core.HTML({ sanitizeContent: false, content: '<div></div>' });
+
+  // ── Project / Op info dialogs (header clicks) ────────────────────────────
+  var _oProjDetailsDialog = null;
+  var _oProjDetailsHtml   = null;
+  var _oOpDetailsDialog   = null;
+  var _oOpDetailsHtml     = null;
+
+  function _buildProjectDetailsHtml() {
+    var esc = function (s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+    var projNo    = esc(_jobState.job_number      || '');
+    var projTitle = esc(_jobState.job_title       || '');
+    var projDesc  = esc(_jobState.job_description || '');
+    return '<div class="vtPd-w">'
+      + '<style>'
+      + '.vtPd-w{font-family:"Segoe UI",Arial,sans-serif;padding:0;color:#2c3e50;}'
+      + '.vtPd-i{margin:20px auto;padding:0 16px;box-sizing:border-box;}'
+      + '.vtPd-hdr{background:#fff;padding:24px;border-left:6px solid #2c7be5;border-radius:8px;box-shadow:0 3px 10px rgba(0,0,0,.08);margin-bottom:24px;}'
+      + '.vtPd-h1{font-size:22px;color:darkblue;font-weight:bold;margin:0 0 8px;}'
+      + '.vtPd-desc{font-size:15px;line-height:1.6;color:#555;margin-top:8px;}'
+      + '.vtPd-imgs{background:#fff;padding:24px;border-radius:8px;box-shadow:0 3px 10px rgba(0,0,0,.08);}'
+      + '.vtPd-no-img{font-style:italic;color:#888;}'
+      + '.vtPd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;}'
+      + '.vtPd-card{background:#fafafa;border-radius:6px;overflow:hidden;border:1px solid #e0e6ed;}'
+      + '.vtPd-card img{width:100%;height:240px;object-fit:cover;display:block;}'
+      + '.vtPd-cap{padding:8px 12px;font-size:14px;color:green;font-weight:bold;}'
+      + '</style>'
+      + '<div class="vtPd-i">'
+      + '<div class="vtPd-hdr">'
+      + '<p class="vtPd-h1">Program #' + projNo + (projTitle ? ' - ' + projTitle : '') + '</p>'
+      + (projDesc ? '<p class="vtPd-desc">' + projDesc + '</p>' : '')
+      + '</div>'
+      + '<div class="vtPd-imgs"><p class="vtPd-no-img">No images available for this project.</p></div>'
+      + '</div></div>';
+  }
+
+  function _buildOpDetailsHtml() {
+    var esc = function (s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+    var op        = (oOpSelect && oOpSelect.getSelectedKey()) || '';
+    var opMeta    = _opMetaMap[op] || {};
+    var projNo    = esc(_jobState.job_number      || '');
+    var projTitle = esc(_jobState.job_title       || '');
+    var opNum     = esc(op);
+    var opTitle   = esc(opMeta.op_title       || '');
+    var opDesc    = esc(opMeta.op_description || '');
+    return '<div class="vtOd-w">'
+      + '<style>'
+      + '.vtOd-w{font-family:"Segoe UI",Arial,sans-serif;padding:0;color:#2c3e50;}'
+      + '.vtOd-i{margin:20px auto;padding:0 16px;box-sizing:border-box;}'
+      + '.vtOd-hdr{background:#fff;padding:24px;border-left:6px solid #2c7be5;border-radius:8px;box-shadow:0 3px 10px rgba(0,0,0,.08);margin-bottom:24px;}'
+      + '.vtOd-h1{font-size:22px;color:darkblue;font-weight:bold;margin:0 0 4px;}'
+      + '.vtOd-h2{font-size:17px;color:darkslategray;font-style:italic;margin:0 0 8px;}'
+      + '.vtOd-desc{font-size:15px;line-height:1.6;color:#555;margin-top:8px;}'
+      + '.vtOd-imgs{background:#fff;padding:24px;border-radius:8px;box-shadow:0 3px 10px rgba(0,0,0,.08);}'
+      + '.vtOd-no-img{font-style:italic;color:#888;}'
+      + '.vtOd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;}'
+      + '.vtOd-card{background:#fafafa;border-radius:6px;overflow:hidden;border:1px solid #e0e6ed;}'
+      + '.vtOd-card img{width:100%;height:240px;object-fit:cover;display:block;}'
+      + '.vtOd-cap{padding:8px 12px;font-size:14px;color:green;font-weight:bold;}'
+      + '</style>'
+      + '<div class="vtOd-i">'
+      + '<div class="vtOd-hdr">'
+      + '<p class="vtOd-h1">Program #' + projNo + (projTitle ? ' - ' + projTitle : '') + '</p>'
+      + '<p class="vtOd-h2">' + opNum + (opTitle ? ' - ' + opTitle : '') + '</p>'
+      + (opDesc ? '<p class="vtOd-desc">' + opDesc + '</p>' : '')
+      + '</div>'
+      + '<div class="vtOd-imgs"><p class="vtOd-no-img">No images available for this operation.</p></div>'
+      + '</div></div>';
+  }
+
+  function _openDetailsDialog(htmlFn, titleFn, dialogRef, htmlRef, setters) {
+    if (!setters[0]) {
+      setters[1] = new sap.ui.core.HTML({ sanitizeContent: false });
+      setters[0] = new sap.m.Dialog({
+        contentWidth: '660px', contentHeight: '72vh',
+        resizable: true, draggable: true,
+        content: [new sap.m.ScrollContainer({
+          vertical: true, horizontal: false, height: '100%',
+          content: [setters[1]]
+        })],
+        endButton: new sap.m.Button({ text: 'Close', press: function () { setters[0].close(); } })
+      });
+    }
+    var html = htmlFn();
+    var dom  = setters[1].getDomRef();
+    if (dom) { dom.innerHTML = html; } else { setters[1].setContent(html); }
+    setters[0].setTitle(titleFn());
+    setters[0].open();
+  }
+
+  window.vtShowProjectDetails = function () {
+    if (!_jobState.job_number) return;
+    var s = [_oProjDetailsDialog, _oProjDetailsHtml];
+    _openDetailsDialog(
+      _buildProjectDetailsHtml,
+      function () { return 'Program #' + (_jobState.job_number || '') + (_jobState.job_title ? ' - ' + _jobState.job_title : ''); },
+      null, null, s
+    );
+    _oProjDetailsDialog = s[0];
+    _oProjDetailsHtml   = s[1];
+  };
+
+  window.vtShowOpDetails = function () {
+    var op = oOpSelect && oOpSelect.getSelectedKey();
+    if (!op) { sap.m.MessageToast.show('Select an op first.'); return; }
+    var s = [_oOpDetailsDialog, _oOpDetailsHtml];
+    _openDetailsDialog(
+      _buildOpDetailsHtml,
+      function () { var m = _opMetaMap[op] || {}; return op + (m.op_title ? ' - ' + m.op_title : ''); },
+      null, null, s
+    );
+    _oOpDetailsDialog = s[0];
+    _oOpDetailsHtml   = s[1];
+  };
+
+  function _buildHomeHeaderHtml() {
+    var tc        = '#0854a0';
+    var op        = (oOpSelect && oOpSelect.getSelectedKey()) || '';
+    var opMeta    = _opMetaMap[op] || {};
+    var projNo    = _jobState.job_number        || '';
+    var projTitle = _jobState.job_title         || '';
+    var opTitle   = opMeta.op_title             || '';
+    var targetCT  = _jobState.target_cycle_time || '';
+    var usedCT    = maxCycleEnd ? maxCycleEnd.toFixed(2) : '';
+
+    var aStyle  = 'color:' + tc + ';text-decoration:none;cursor:pointer;';
+    var opBlock = opTitle ? '&nbsp;&mdash;&nbsp;<i>' + opTitle + '</i>' : '';
+
+    var projLink = projNo
+      ? '<a onclick="vtShowProjectDetails()" style="' + aStyle + '">Program #' + projNo + '</a>'
+      : '<span style="color:' + tc + ';">Program #&mdash;</span>';
+    var opLink = op
+      ? '<a onclick="vtShowOpDetails()" style="' + aStyle + '"><i>' + op + '</i></a>'
+      : '<span style="color:' + tc + ';font-style:italic;">&mdash;</span>';
+
+    return [
+      '<div style="font-family:\'Segoe UI\',\'Helvetica Neue\',Arial,sans-serif;margin:0;padding:0;color:' + tc + ';">',
+      '  <div style="border-bottom:2px solid ' + tc + ';padding:6px 14px;">',
+      '    <div style="margin:0;font-size:22px;font-weight:bold;letter-spacing:0.5px;line-height:1.2;">',
+      '      ' + projLink + (projTitle ? '&nbsp;&mdash;&nbsp;' + projTitle : ''),
+      '    </div>',
+      '    <div style="margin:2px 0 0 0;font-size:15px;line-height:1.2;">',
+      '      ' + opLink + opBlock,
+      '    </div>',
+      '    <div style="margin-top:4px;font-size:14px;">',
+      '      <span>Target Cycle Time:</span>' + (targetCT ? ' <b>' + targetCT + 's</b>' : ' <em>&mdash;</em>') +
+      '&nbsp;&nbsp;<span>Calculated Cycle Time:</span>' + (usedCT ? ' <b>' + usedCT + 's</b>' : ' <em>&mdash;</em>'),
+      '    </div>',
+      '  </div>',
+      '</div>'
+    ].join('\n');
+  }
+
+  function _refreshHomeHeader() {
+    if (!oHomeHeaderHtml) return;
+    var newHtml = _buildHomeHeaderHtml();
+    var dom = oHomeHeaderHtml.getDomRef();
+    if (dom) {
+      dom.innerHTML = newHtml;   // direct DOM swap — no SAPUI5 re-render, no stale copy
+    } else {
+      oHomeHeaderHtml.setContent(newHtml);
+    }
+  }
+
+  // ── Home scale toolbar (above the tree) ──────────────────────────────────
+  var oHomeScaleLabel = new sap.m.Label({ text: scaleFactor.toFixed(1) + " px/s", width: "54px" });
+
+  var oHomeSlider = new sap.m.Slider({
+    min:   0.5,
+    max:   12,
+    step:  0.5,
+    value: scaleFactor,
+    width: "220px",
+    liveChange: function (oEvent) {
+      scaleFactor = parseFloat(oEvent.getParameter("value"));
+      oSettingsModel.setProperty("/scaleFactor", scaleFactor);
+      oHomeScaleLabel.setText(scaleFactor.toFixed(1) + " px/s");
+      if (oScaleLabel)  oScaleLabel.setText(scaleFactor.toFixed(1) + " px/s");
+      if (oSlider)      oSlider.setValue(scaleFactor);
+      updateGanttColumn();
+      updateRuler();
+    }
+  });
+
+  var oHomeScaleToolbar = new sap.m.Toolbar({
+    height: "2.4rem",
+    style:  "Clear",
+    content: [
+      new sap.m.Button({
+        text: "Expand All",
+        type: "Transparent",
+        press: function () { oHomeTable.expandToLevel(10); }
+      }),
+      new sap.m.Button({
+        text: "Collapse All",
+        type: "Transparent",
+        press: function () { oHomeTable.collapseAll(); }
+      }),
+      new sap.m.ToolbarSeparator(),
+      new sap.m.Label({ text: "Scale:" }),
+      new sap.m.ToolbarSpacer({ width: "6px" }),
+      oHomeSlider,
+      new sap.m.ToolbarSpacer({ width: "6px" }),
+      oHomeScaleLabel
+    ]
+  }).addStyleClass("sapUiSizeCompact");
+
+  var oHomeInnerLayout = new sap.ui.layout.FixFlex({
+    vertical:    true,
+    fixFirst:    true,
+    fixContent:  [oHomeScaleToolbar],
+    flexContent: oHomeTable
+  });
+
+  var oHomeLayout = new sap.ui.layout.FixFlex({
+    vertical:    true,
+    fixContent:  [oHomeHeaderHtml],
+    flexContent: oHomeInnerLayout
+  });
+
   // ── Column / ruler update helpers ─────────────────────────────────────────
   function updateGanttColumn() {
-    oGanttColumn.setWidth((Math.ceil(scaleFactor * maxCycleEnd) + 50) + "px");
+    var w = (Math.ceil(scaleFactor * maxCycleEnd) + 50) + "px";
+    oGanttColumn.setWidth(w);
+    if (oHomeGanttColumn) oHomeGanttColumn.setWidth(w);
   }
 
   function updateRuler() {
-    oRulerHtml.setContent(buildRulerHtml(scaleFactor, maxCycleEnd));
+    var html = buildRulerHtml(scaleFactor, maxCycleEnd);
+    oRulerHtml.setContent(html);
+    if (oHomeRulerHtml) oHomeRulerHtml.setContent(html);
+    _refreshHomeHeader();
   }
 
   // ── Project metadata helpers ──────────────────────────────────────────────
@@ -2477,9 +3001,9 @@ sap.ui.getCore().attachInit(function () {
       _jobState.job_number = projectMeta.project_no;
       if (oJobNumLabel) oJobNumLabel.setText('#' + projectMeta.project_no);
     }
-    if (projectMeta.project_title)      _jobState.job_title            = projectMeta.project_title;
-    if (projectMeta.project_description)_jobState.job_description      = projectMeta.project_description;
-    if (projectMeta.target_cycle_time)  _jobState.target_cycle_time    = projectMeta.target_cycle_time;
+    _jobState.job_title         = projectMeta.project_title       || '';
+    _jobState.job_description   = projectMeta.project_description  || '';
+    _jobState.target_cycle_time = projectMeta.target_cycle_time != null ? projectMeta.target_cycle_time : '';
     _jobState.machine_list         = _splitList(projectMeta.machine_list);
     _jobState.robot_list           = _splitList(projectMeta.robot_list);
     _jobState.operator_list        = _splitList(projectMeta.operator_list);
@@ -2488,7 +3012,7 @@ sap.ui.getCore().attachInit(function () {
 
   // ── API calls ─────────────────────────────────────────────────────────────
   function loadTree(opNumber) {
-    nAutoExpandLevel = 2;
+    nAutoExpandLevel = 2; nHomeAutoExpandLevel = 2;
     fetch(API_BASE + "/updateTree", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
@@ -2501,10 +3025,10 @@ sap.ui.getCore().attachInit(function () {
       .then(function (response) {
         var responseData    = response.data || {};
         var items           = (responseData.cycle_general_structure) || responseData || [];
-        var opMetaRows      = responseData.op_metadata      || [];
-        var projectMetaRows = responseData.project_metadata || [];
-        var itemsDetailRows = responseData.items_details    || [];
+        var opMetaRows      = responseData.op_metadata   || [];
+        var itemsDetailRows = responseData.items_details || [];
 
+        // Op-specific metadata only — job data stays as loaded from /updateProjectNumbers
         opMetaRows.forEach(function (row) {
           if (row.op_number) {
             _opMetaMap[row.op_number] = {
@@ -2515,17 +3039,15 @@ sap.ui.getCore().attachInit(function () {
           }
         });
 
-        // Cache items_details rows keyed by item_id for fast lookup
-        console.log('[vtItemsDetails] op:', opNumber, '— rows received:', itemsDetailRows.length, itemsDetailRows);
         if (itemsDetailRows.length) {
           _itemsDetailsCache[opNumber] = {};
           itemsDetailRows.forEach(function (row) {
             if (row.item_id) { _itemsDetailsCache[opNumber][row.item_id] = row; }
           });
         }
-        console.log('[vtItemsDetails] cache after load:', JSON.parse(JSON.stringify(_itemsDetailsCache)));
 
-        _applyProjectMeta(projectMetaRows[0] || null);
+        console.log('[loadTree] op:', opNumber, '— opMeta:', _opMetaMap[opNumber], '— _jobState.target_cycle_time:', _jobState.target_cycle_time);
+
         annotateSteps(items, null);
         annotateAncestors(items, []);
         maxCycleEnd = getMaxCycleEnd(items) || 500;
@@ -2544,7 +3066,7 @@ sap.ui.getCore().attachInit(function () {
 
   function _loadTreeFromCache(opNumber) {
     var items = JSON.parse(JSON.stringify(_opTreeCache[opNumber] || []));
-    nAutoExpandLevel = 2;
+    nAutoExpandLevel = 2; nHomeAutoExpandLevel = 2;
     annotateSteps(items, null);
     annotateAncestors(items, []);
     maxCycleEnd = getMaxCycleEnd(items) || 500;
@@ -2573,6 +3095,7 @@ sap.ui.getCore().attachInit(function () {
     });
     oOpSelect.setSelectedKey("");
     oDataModel.setData({ items: [], maxCycleEnd: 500 });
+    _refreshHomeHeader();
     // Release flag after current tick so any queued SAPUI5 change events
     // from removeAllItems/setSelectedKey are still suppressed
     setTimeout(function () { _suppressOpChange = false; }, 0);
@@ -2583,8 +3106,18 @@ sap.ui.getCore().attachInit(function () {
     fetch(API_BASE + '/updateProjectNumbers', { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function (response) {
-        _projectOpMap = response.data || {};
-        var projNums  = Object.keys(_projectOpMap);
+        var d        = response.data || {};
+        var projNums = Object.keys(d);
+
+        _projectOpMap   = {};
+        _projectMetaMap = {};
+        projNums.forEach(function (pn) {
+          _projectOpMap[pn]   = (d[pn] && d[pn].op_list)  || [];
+          _projectMetaMap[pn] = (d[pn] && d[pn].proj_data) || null;
+        });
+
+        console.log('[loadProjectList] projects:', projNums);
+        console.log('[loadProjectList] _projectMetaMap:', JSON.parse(JSON.stringify(_projectMetaMap)));
 
         oJobSelect.removeAllItems();
         oJobSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select Job…" }));
@@ -2596,7 +3129,9 @@ sap.ui.getCore().attachInit(function () {
           var firstJob = projNums[0];
           oJobSelect.setSelectedKey(firstJob);
           _jobState.job_number = firstJob;
-          var ops = _populateOpSelect(firstJob);
+          _applyProjectMeta(_projectMetaMap[firstJob] || null);
+          _populateOpSelect(firstJob);
+          setTimeout(_prefetchJobOps, 0);   // start loading all ops in background
         }
       })
       .catch(function (err) {
@@ -2618,6 +3153,8 @@ sap.ui.getCore().attachInit(function () {
       scaleFactor = parseFloat(oEvent.getParameter("value"));
       oSettingsModel.setProperty("/scaleFactor", scaleFactor);
       oScaleLabel.setText(scaleFactor.toFixed(1) + " px/s");
+      if (oHomeScaleLabel) oHomeScaleLabel.setText(scaleFactor.toFixed(1) + " px/s");
+      if (oHomeSlider)     oHomeSlider.setValue(scaleFactor);
       updateGanttColumn();
       updateRuler();
     }
@@ -2694,10 +3231,12 @@ sap.ui.getCore().attachInit(function () {
   var oOpTitleInput = new sap.m.Input({ placeholder: "Op title",   width: "100%" });
   var oOpDescInput  = new sap.m.TextArea({ placeholder: "Op description", width: "100%", rows: 3 });
   var oOpPartsInput = new sap.m.StepInput({ min: 1, max: 999, value: 1, width: "120px" });
-  var _opDialogMode = "add";
+  var _opDialogMode    = "add";
+  var _opDialogOrigNum = null; // original op number when editing
 
   function openOpDialog(mode, opNumber) {
-    _opDialogMode = mode;
+    _opDialogMode    = mode;
+    _opDialogOrigNum = opNumber || null;
     oOpNumInput.setValueState("None");
     if (mode === "add") {
       oOpDialog.setTitle("New Operation");
@@ -2706,7 +3245,7 @@ sap.ui.getCore().attachInit(function () {
     } else {
       var meta = _opMetaMap[opNumber] || {};
       oOpDialog.setTitle("Edit Op: " + opNumber);
-      oOpNumInput.setValue(opNumber).setEditable(false);
+      oOpNumInput.setValue(opNumber).setEditable(true);
       oOpTitleInput.setValue(meta.op_title || "");
       oOpDescInput.setValue(meta.op_description || "");
       oOpPartsInput.setValue(meta.num_of_parts || 1);
@@ -2717,15 +3256,34 @@ sap.ui.getCore().attachInit(function () {
   function _saveOpDialog() {
     var opNum = oOpNumInput.getValue().trim();
     if (!opNum) { oOpNumInput.setValueState("Error").setValueStateText("Op # is required"); return; }
-    // Check for duplicate op # when adding
-    if (_opDialogMode === "add") {
-      var existing = oOpSelect.getItems().map(function (i) { return i.getKey(); });
-      if (existing.indexOf(opNum) >= 0) {
-        oOpNumInput.setValueState("Error").setValueStateText("Op '" + opNum + "' already exists");
-        return;
-      }
+    // Check for duplicate op # (always — both add and rename)
+    var existing = oOpSelect.getItems().map(function (i) { return i.getKey(); });
+    if (opNum !== _opDialogOrigNum && existing.indexOf(opNum) >= 0) {
+      oOpNumInput.setValueState("Error").setValueStateText("Op '" + opNum + "' already exists");
+      return;
     }
     oOpNumInput.setValueState("None");
+
+    // Handle op number rename in edit mode
+    if (_opDialogMode === "edit" && opNum !== _opDialogOrigNum) {
+      var oldNum = _opDialogOrigNum;
+      // Move cache entries to new key
+      _opMetaMap[opNum]         = _opMetaMap[oldNum]         || {};
+      _opTreeCache[opNum]       = _opTreeCache[oldNum]        || [];
+      _itemsDetailsCache[opNum] = _itemsDetailsCache[oldNum]  || {};
+      delete _opMetaMap[oldNum];
+      delete _opTreeCache[oldNum];
+      delete _itemsDetailsCache[oldNum];
+      // Update dropdown item key + text
+      var dropItem = oOpSelect.getItems().find(function (i) { return i.getKey() === oldNum; });
+      if (dropItem) { dropItem.setKey(opNum); dropItem.setText(opNum); }
+      // If the renamed op was selected, switch selection to new key
+      if (oOpSelect.getSelectedKey() === oldNum) { oOpSelect.setSelectedKey(opNum); }
+      // Queue old op for deletion on next save
+      if (_opsToDelete.indexOf(oldNum) < 0) { _opsToDelete.push(oldNum); }
+      _opDialogOrigNum = opNum;
+    }
+
     _opMetaMap[opNum] = {
       op_title:       oOpTitleInput.getValue().trim(),
       op_description: oOpDescInput.getValue().trim(),
@@ -3176,114 +3734,116 @@ sap.ui.getCore().attachInit(function () {
     change: function (oEvent) {
       var key = oEvent.getParameter("selectedItem") && oEvent.getParameter("selectedItem").getKey();
       if (!key) return;
-      _jobState.job_number = key;
+
+      _jobState.job_number           = key;
+      _jobState.job_title            = '';
+      _jobState.job_description      = '';
+      _jobState.target_cycle_time    = '';
+      _jobState.machine_list         = [];
+      _jobState.robot_list           = [];
+      _jobState.operator_list        = [];
+      _jobState.predefined_processes = [];
+
+      console.log('[oJobSelect.change] switching to job:', key);
+      console.log('[oJobSelect.change] _opTreeCache keys before clear:', Object.keys(_opTreeCache));
+      console.log('[oJobSelect.change] _opMetaMap before clear:', JSON.parse(JSON.stringify(_opMetaMap)));
+      console.log('[oJobSelect.change] _itemsDetailsCache keys before clear:', Object.keys(_itemsDetailsCache));
+      console.log('[oJobSelect.change] _projectMetaMap[key]:', _projectMetaMap[key] || null);
+
       _opTreeCache       = {};
       _opMetaMap         = {};
       _itemsDetailsCache = {};
       _opsToDelete       = [];
+
+      // Apply stored project metadata immediately — no extra API call needed
+      _applyProjectMeta(_projectMetaMap[key] || null);
+
       oDataModel.setData({ items: [], maxCycleEnd: 500 });
       maxCycleEnd = 0;
       updateGanttColumn();
       updateRuler();
       setTimeout(_updateMiniPie, 0);
-      if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
       _populateOpSelect(key);
+      setTimeout(_prefetchJobOps, 0);   // load all ops in background; render stats if tab is open
     }
   });
   // Placeholder item (shown when nothing is selected)
   oJobSelect.addItem(new sap.ui.core.Item({ key: "", text: "Select Job…" }));
 
-  // ── Job Toolbar ───────────────────────────────────────────────────────────
-  var oJobToolbar = new sap.m.Toolbar({
-    style: "Standard",
-    content: [
-      new sap.m.HBox({
-        alignItems: "Center",
-        items: [
-          new sap.m.Label({ text: "Job:", labelFor: oJobSelect }),
-          oJobSelect,
-          new sap.m.Button({
-            icon:    "sap-icon://add",
-            type:    "Transparent",
-            tooltip: "Create a new job/project",
-            press: function () { openJobDialog("add"); }
-          }),
-          new sap.m.Button({
-            icon:    "sap-icon://edit",
-            type:    "Transparent",
-            tooltip: "Edit current job settings (name, target cycle time, machines, robots, operators)",
-            press: function () { openJobDialog("edit"); }
-          }),
-          new sap.m.Button({
-            icon:    "sap-icon://delete",
-            type:    "Reject",
-            tooltip: "Delete the selected job/project",
-            press: function () { sap.m.MessageToast.show("Delete Job: not yet implemented."); }
-          })
-        ]
-      }).addStyleClass("vtJobSection"),
-      new sap.m.HBox({
-        alignItems: "Center",
-        items: [
-          new sap.m.Label({ text: "Op/Cell:", labelFor: oOpSelect }),
-          oOpSelect,
-          new sap.m.Button({ icon: "sap-icon://add", type: "Transparent", tooltip: "Add new Operation",
-            press: function () { openOpDialog("add", null); }
-          }),
-          new sap.m.Button({ icon: "sap-icon://edit", type: "Transparent", tooltip: "Edit current Operation settings",
-            press: function () {
-              var op = oOpSelect.getSelectedKey();
-              if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
-              openOpDialog("edit", op);
-            }
-          }),
-          new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate current Operation",
-            press: function () { openDupOpDialog(); }
-          }),
-          new sap.m.Button({ icon: "sap-icon://delete", type: "Reject", tooltip: "Delete current Operation",
-            press: function () {
-              var op = oOpSelect.getSelectedKey();
-              if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
-              if (!window.confirm('Are you sure you want to delete Op "' + op + '"?\nThis cannot be undone.')) return;
-              _opsToDelete.push(op);
-              var allItems = oOpSelect.getItems();
-              for (var k = 0; k < allItems.length; k++) {
-                if (allItems[k].getKey() === op) { oOpSelect.removeItem(allItems[k]); break; }
-              }
-              sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
-            }
-          }),
-          new sap.m.Button({
-            icon:    "sap-icon://upload-to-cloud",
-            type:    "Transparent",
-            tooltip: "Import Excel file (.xlsx / .xls / .xlsm) — adds stations to current Op (header on row 10, columns: DESCRIPTION, SEC, SEC.1)",
-            press: function () { document.getElementById('vtXlsxInput').click(); }
-          })
-        ]
-      }).addStyleClass("vtOpSection"),
-      new sap.m.ToolbarSpacer(),
-      new sap.m.ToggleButton({
-        icon:    "sap-icon://detail-view",
-        pressed: true,
-        tooltip: "Show/Hide Run Condition panel",
-        press:   function (oEvent) { oRcToolbar.setVisible(oEvent.getParameter("pressed")); }
-      }),
-      new sap.m.ToggleButton({
-        icon:    "sap-icon://action-settings",
-        pressed: true,
-        tooltip: "Show/Hide Design Toolbar",
-        press:   function (oEvent) { oTreeDesignToolbar.setVisible(oEvent.getParameter("pressed")); }
-      }),
-      new sap.m.ToolbarSeparator(),
+  // ── Job / Op HBoxes (shared — used in page header) ───────────────────────
+  var oJobHBox = new sap.m.HBox({
+    alignItems: "Center",
+    items: [
+      new sap.m.Label({ text: "Job #:", labelFor: oJobSelect }),
+      oJobSelect,
       new sap.m.Button({
-        icon:    "sap-icon://save",
-        text:    "Save",
-        type:    "Emphasized",
-        tooltip: "Save all changes to database",
-        press: function () { saveToDb(); }
+        icon:    "sap-icon://add",
+        type:    "Transparent",
+        tooltip: "Create a new job/project",
+        press: function () { openJobDialog("add"); }
+      }),
+      new sap.m.Button({
+        icon:    "sap-icon://edit",
+        type:    "Transparent",
+        tooltip: "Edit current job settings (name, target cycle time, machines, robots, operators)",
+        press: function () { openJobDialog("edit"); }
+      }),
+      new sap.m.Button({
+        icon:    "sap-icon://delete",
+        type:    "Reject",
+        tooltip: "Delete the selected job/project",
+        press: function () { sap.m.MessageToast.show("Delete Job: not yet implemented."); }
       })
     ]
-  }).addStyleClass('sapUiSizeCompact');
+  }).addStyleClass("vtJobSection");
+
+  var oOpHBox = new sap.m.HBox({
+    alignItems: "Center",
+    items: [
+      new sap.m.Label({ text: "Op/Cell:", labelFor: oOpSelect }),
+      oOpSelect,
+      new sap.m.Button({ icon: "sap-icon://add", type: "Transparent", tooltip: "Add new Operation",
+        press: function () { openOpDialog("add", null); }
+      }),
+      new sap.m.Button({ icon: "sap-icon://edit", type: "Transparent", tooltip: "Edit current Operation settings",
+        press: function () {
+          var op = oOpSelect.getSelectedKey();
+          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+          openOpDialog("edit", op);
+        }
+      }),
+      new sap.m.Button({ icon: "sap-icon://copy", type: "Transparent", tooltip: "Duplicate current Operation",
+        press: function () { openDupOpDialog(); }
+      }),
+      new sap.m.Button({ icon: "sap-icon://delete", type: "Reject", tooltip: "Delete current Operation",
+        press: function () {
+          var op = oOpSelect.getSelectedKey();
+          if (!op) { sap.m.MessageToast.show("Select an Op first."); return; }
+          if (!window.confirm('Are you sure you want to delete Op "' + op + '"?\nThis cannot be undone.')) return;
+          _opsToDelete.push(op);
+          var allItems = oOpSelect.getItems();
+          for (var k = 0; k < allItems.length; k++) {
+            if (allItems[k].getKey() === op) { oOpSelect.removeItem(allItems[k]); break; }
+          }
+          sap.m.MessageToast.show('Op "' + op + '" marked for deletion. Save to apply.');
+        }
+      }),
+      new sap.m.Button({
+        icon:    "sap-icon://upload-to-cloud",
+        type:    "Transparent",
+        tooltip: "Import Excel file (.xlsx / .xls / .xlsm) — adds stations to current Op (header on row 10, columns: DESCRIPTION, SEC, SEC.1)",
+        press: function () { document.getElementById('vtXlsxInput').click(); }
+      })
+    ]
+  }).addStyleClass("vtOpSection");
+
+  var oTabBarSaveBtn = new sap.m.Button({
+    icon:    "sap-icon://save",
+    text:    "Save",
+    type:    "Emphasized",
+    tooltip: "Save all changes to database",
+    press: function () { saveToDb(); }
+  });
 
   // ── RC Status Label ───────────────────────────────────────────────────────
   var oRcStatusLabel = new sap.m.Label({ text: '' });
@@ -3908,7 +4468,8 @@ sap.ui.getCore().attachInit(function () {
           '<canvas id="vtMiniPieCanvas"></canvas>' +
         '</div>' +
         '<div id="vtMiniPieInfo" class="vtMiniPieInfo">—</div>' +
-      '</div>'
+      '</div>',
+    afterRendering: function () { setTimeout(_updateMiniPie, 0); }
   });
 
   // ── RC section: three GroupBox-style panels + status bar ─────────────────
@@ -3916,7 +4477,25 @@ sap.ui.getCore().attachInit(function () {
     width: '100%',
     items: [
       new sap.m.FlexBox({ wrap: 'Wrap', alignItems: 'Stretch', width: '100%',
-        items: [ oAddRemoveBox, oRcPhasesBox, new sap.m.ToolbarSpacer(), oCopyPasteBox, new sap.m.ToolbarSpacer(), oMiniPieWidget ]
+        items: [ oAddRemoveBox, oRcPhasesBox, oCopyPasteBox,
+          new sap.m.VBox({
+            alignItems: 'Center',
+            items: [
+              new sap.m.Button({
+                icon:    "sap-icon://detail-view",
+                type:    "Default",
+                tooltip: "Open More Spec for selected item",
+                press: function () {
+                  var item = getCurrentItem();
+                  if (item) { _openMoreSpecDialog(item); }
+                  else { sap.m.MessageToast.show("Select an item first."); }
+                }
+              }),
+              new sap.m.Label({ text: 'More Spec' }).addStyleClass('vtAddRemoveLabel')
+            ]
+          }).addStyleClass('vtRcAddRemoveBox'),
+          new sap.m.HBox({ layoutData: new sap.m.FlexItemData({ growFactor: 1 }) }),
+          oMiniPieWidget ]
       }),
       oRcStatusBar
     ]
@@ -3950,7 +4529,7 @@ sap.ui.getCore().attachInit(function () {
   // ── Design Tab: job toolbar → RC toolbar → scale toolbar → table ────────────
   var oDesignLayout = new sap.ui.layout.FixFlex({
     vertical:    true,
-    fixContent:  [oJobToolbar, oRcToolbar, oTreeDesignToolbar],
+    fixContent:  [oRcToolbar, oTreeDesignToolbar],
     flexContent: oTable
   });
 
@@ -4333,6 +4912,7 @@ sap.ui.getCore().attachInit(function () {
     .then(function (response) {
       var d = response.data || {};
       var items = d.cycle_general_structure || d || [];
+      // Op-specific data only — job data stays as loaded from /updateProjectNumbers
       (d.op_metadata || []).forEach(function (row) {
         if (row.op_number) {
           _opMetaMap[row.op_number] = {
@@ -4348,7 +4928,6 @@ sap.ui.getCore().attachInit(function () {
           if (row.item_id) { _itemsDetailsCache[opNumber][row.item_id] = row; }
         });
       }
-      _applyProjectMeta((d.project_metadata || [])[0] || null);
       annotateSteps(items, null);
       _opTreeCache[opNumber] = JSON.parse(JSON.stringify(items));
       _updateResourceUsageInCache(opNumber);
@@ -4746,11 +5325,12 @@ sap.ui.getCore().attachInit(function () {
     var pics = (initialPics || '').split(';').filter(Boolean);
 
     function render() {
-      var thumbsHtml = pics.map(function (url, i) {
-        return '<div class="vtPicThumb">' +
-          '<img src="' + url + '" onclick="window.open(\'' + url + '\',\'_blank\')">' +
-          '<button class="vtPicDel" onclick="vtMsDelPic(\'' + tabKey + '\',' + i + ')">✕</button>' +
-          '</div>';
+      var thumbsHtml = pics.filter(Boolean).map(function (url, i) {
+        var safe = String(url).replace(/'/g, '%27');
+        return '<div class="vtPicThumb">'
+          + '<img src="' + safe + '" onclick="window.open(\'' + safe + '\',\'_blank\')">'
+          + '<button class="vtPicDel" onclick="vtMsDelPic(\'' + tabKey + '\',' + i + ')">&#x2715;</button>'
+          + '</div>';
       }).join('');
       var el = document.getElementById('vtPicGrid_' + tabKey);
       if (el) el.innerHTML = thumbsHtml;
@@ -5005,6 +5585,25 @@ sap.ui.getCore().attachInit(function () {
     });
   }
 
+  // Silently cache every op for the current job, then render stats if that tab is active.
+  function _prefetchJobOps() {
+    var ops      = oOpSelect.getItems().map(function (i) { return i.getKey(); }).filter(Boolean);
+    var uncached = ops.filter(function (op) { return !_opTreeCache[op]; });
+    if (!uncached.length) {
+      if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
+      return;
+    }
+    var chain = Promise.resolve();
+    uncached.forEach(function (op) {
+      chain = chain.then(function () { return _fetchTreeToCache(op); });
+    });
+    chain
+      .then(function () {
+        if (oIconTabBar && oIconTabBar.getSelectedKey() === 'stats') { _renderStatsTab(); }
+      })
+      .catch(function (err) { console.warn('[_prefetchJobOps] error:', err); });
+  }
+
   function syncStatsTab() {
     var content = document.getElementById('vtRptContent');
     if (!content) return;
@@ -5012,10 +5611,12 @@ sap.ui.getCore().attachInit(function () {
     if (st) st.style.display = 'none';
     var ops      = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
     var uncached = ops.filter(function (op) { return !_opTreeCache[op]; });
+    // Prefetch already ran on job select — uncached list will usually be empty
     if (!uncached.length) {
       _renderStatsTab();
       return;
     }
+    // Still loading (prefetch in progress or failed) — show progress and wait
     content.innerHTML = '<div style="font-family:72,Arial,sans-serif;font-size:0.82rem;color:#09528A;padding:4px 0;">'
                       + 'Loading data… <span id="vtRptLoadProgress">0 / ' + uncached.length + '</span></div>';
     var done  = 0;
@@ -5071,14 +5672,11 @@ sap.ui.getCore().attachInit(function () {
   var oIconTabBar = new sap.m.IconTabBar({
     expandable:           false,
     stretchContentHeight: true,
-    selectedKey:          "design",
+    selectedKey:          "home",
     items: [
       new sap.m.IconTabFilter({
         key: "home", text: "Home",
-        content: [new sap.ui.core.HTML({
-          content:         '<div style="padding:48px;color:#aaa;font-family:72,Arial,sans-serif;font-size:15px;">Home — coming soon</div>',
-          sanitizeContent: false
-        })]
+        content: [oHomeLayout]
       }),
       new sap.m.IconTabFilter({
         key: "design", text: "Design",
@@ -5132,27 +5730,36 @@ sap.ui.getCore().attachInit(function () {
       var key = oEvent.getParameter("key");
       if (key === "design") {
         setTimeout(function () { oTable.invalidate(); }, 0);
+      } else if (key === "home") {
+        _refreshHomeHeader();
+        setTimeout(function () { oHomeTable.invalidate(); }, 0);
       } else if (key === "stats") {
         setTimeout(syncStatsTab, 60);
       }
     }
   });
 
+
   // ── Page / App ────────────────────────────────────────────────────────────
   var oPage = new sap.m.Page({
-    title:         "ValiantTMS — Cycle Chart Management",
     showNavButton: false,
-    headerContent: [
-      new sap.ui.core.HTML({
-        content:         '<img src="https://www.valianttms.com/wp-content/uploads/2021/09/valianttms-logo-298x92-1.png" height="36" style="vertical-align:middle;display:block;" />',
-        sanitizeContent: false
-      })
-    ],
+    customHeader: new sap.m.Bar({
+      contentLeft:  [oJobHBox, oOpHBox, oTabBarSaveBtn],
+      contentRight: [
+        new sap.m.Text({ text: "ValiantTMS — Cycle Chart Management", wrapping: false })
+          .addStyleClass("vtPageTitle"),
+        new sap.ui.core.HTML({
+          content:         '<img src="https://www.valianttms.com/wp-content/uploads/2021/09/valianttms-logo-298x92-1.png" height="32" style="vertical-align:middle;display:block;margin-left:8px;" />',
+          sanitizeContent: false
+        })
+      ]
+    }).addStyleClass("sapUiSizeCompact vtPageHeaderBar"),
     content: [oIconTabBar]
   });
 
   new sap.m.App({ pages: [oPage] }).placeAt("content");
 
+  // ── Mount toggle + Save buttons into the right side of the tab strip ────────
   // ── Global keyboard + background-click handlers ───────────────────────────
   // Capture phase fires before SAPUI5 processes the click, so __vtOnItemClick
   // can read _ctrlKeyHeld reliably.
