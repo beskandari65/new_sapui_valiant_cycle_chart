@@ -455,11 +455,15 @@ def api_tree():
 
 @app.route("/updateDB", methods=["POST"])
 def api_update_db():
+    global SAMPLE_DATA
     data       = request.get_json() or {}
     import json as _json
     print("[updateDB] full payload:\n" + _json.dumps(data, indent=2))
     updated_db = data.get("cycle_general_structure", data.get("updated_db", []))
     op_number  = data.get("op_number", "")
+    item_ids_to_delete = [str(item_id) for item_id in data.get("item_ids_to_delete", []) if item_id]
+    ops_to_delete = [str(op) for op in data.get("ops_to_delete", []) if op]
+    projects_to_delete = [str(project) for project in data.get("projects_to_delete", []) if project]
 
     # Persist job_metadata for this op if provided
     job_meta = data.get("job_metadata")
@@ -533,6 +537,22 @@ def api_update_db():
         conn = sqlite3.connect(DB_PATH)
         cur  = conn.cursor()
         _ensure_project_number_col(conn)
+        _ensure_items_details_table(conn)
+
+        # Deletions are submitted with Save instead of being applied at edit
+        # time. This lets the browser restore the item from its undo history.
+        if item_ids_to_delete:
+            ph = ",".join("?" for _ in item_ids_to_delete)
+            cur.execute(f"DELETE FROM {TABLE_NAME} WHERE item_id IN ({ph})", item_ids_to_delete)
+            cur.execute(f"DELETE FROM items_details WHERE item_id IN ({ph})", item_ids_to_delete)
+        for deleted_op in ops_to_delete:
+            cur.execute(f"DELETE FROM {TABLE_NAME} WHERE op_number = ?", (deleted_op,))
+            cur.execute("DELETE FROM items_details WHERE op_number = ?", (deleted_op,))
+            OP_NUMBERS.discard(deleted_op)
+            OP_METADATA.pop(deleted_op, None)
+        for deleted_project in projects_to_delete:
+            cur.execute(f"DELETE FROM {TABLE_NAME} WHERE project_number = ?", (deleted_project,))
+            cur.execute("DELETE FROM project_metadata WHERE project_no = ?", (deleted_project,))
 
         # Discover existing columns; auto-add any new ones from the payload
         cur.execute(f"PRAGMA table_info({TABLE_NAME})")
@@ -573,6 +593,12 @@ def api_update_db():
             item_id = record.get("item_id")
             if item_id and item_id in by_id:
                 by_id[item_id].update(record)
+        if item_ids_to_delete:
+            SAMPLE_DATA = [r for r in SAMPLE_DATA if str(r.get("item_id")) not in item_ids_to_delete]
+        for deleted_op in ops_to_delete:
+            SAMPLE_DATA = [r for r in SAMPLE_DATA if str(r.get("op_number")) != deleted_op]
+            OP_NUMBERS.discard(deleted_op)
+            OP_METADATA.pop(deleted_op, None)
 
     return jsonify({
         "request_title": "updated_db",

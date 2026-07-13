@@ -13,8 +13,21 @@
   </script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
+
+    /* PDF export pages are assembled off-screen, then rendered by html2pdf. */
+    .vtPdfPage { width: 1104px; min-height: 760px; padding: 34px 42px; background: #fff; page-break-before: always; break-before: page; }
+    .vtPdfPage:first-child { page-break-before: auto; break-before: auto; }
+    .vtPdfPage h1 { margin: 0 0 12px; color: #09528A; font-size: 30px; }
+    .vtPdfPage h2 { margin: 22px 0 8px; color: #32363a; font-size: 18px; }
+    .vtPdfCover { text-align: center; }
+    .vtPdfLogo { display: block; max-width: 300px; max-height: 94px; margin: 12px auto 28px; }
+    .vtPdfJob { color: #09528A; font-size: 22px; font-weight: 700; margin: 0 0 8px; }
+    .vtPdfMeta { color: #666; margin: 0 0 20px; }
+    .vtPdfScreenshot { display: block; width: 100%; max-height: 570px; object-fit: contain; object-position: top; border: 1px solid #d9d9d9; }
+    .vtPdfComments { margin: 0; padding-left: 22px; max-height: 150px; overflow: hidden; line-height: 1.45; }
 
     /* Tighter row padding so 12 px bars have visible headroom */
     .sapUiTableCell { padding: 0 !important; }
@@ -577,6 +590,7 @@ sap.ui.getCore().attachInit(function () {
   function confirmCopiedItems() {
     if (!oRcState.activeItemIds.length) { sap.m.MessageToast.show("Select items first"); return; }
     if (!window.confirm("Do you want to confirm the copied processes?")) return;
+    beginHistoryAction();
     var items   = oDataModel.getProperty("/items");
     var flatMap = buildFlatMap(items, {});
     var changed = 0;
@@ -713,19 +727,61 @@ sap.ui.getCore().attachInit(function () {
     };
   }
 
-  // Walk a cloned subtree and remap any RC "After..." values that point to old
-  // item_ids that exist in idMap, replacing them with the new cloned ids.
+  // Walk a cloned subtree after every descendant has been assigned an ID. Any
+  // RC value that points inside the copied tree must follow the corresponding
+  // new item ID (the same role as the desktop app's id_map_dict).
   function remapRcRefs(item, idMap) {
     var rc = parseRC(item.run_cond_config);
     var changed = false;
     ['start', 'cycle', 'end'].forEach(function (phase) {
-      if (rc[phase] && rc[phase].condition === RC_COND.AFTER && rc[phase].values.length > 0) {
-        var mapped = idMap[rc[phase].values[0]];
-        if (mapped) { rc[phase].values = [mapped]; changed = true; }
+      if (rc[phase] && rc[phase].values && rc[phase].values.length) {
+        rc[phase].values = rc[phase].values.map(function (value) {
+          var mapped = idMap[value];
+          if (mapped) { changed = true; return mapped; }
+          return value;
+        });
       }
     });
     if (changed) item.run_cond_config = serializeRC(rc);
     (item.sub_process_items || []).forEach(function (child) { remapRcRefs(child, idMap); });
+  }
+
+  // `dependant_items` is derived state. Rebuild it for copied references so
+  // the pasted subtree has the same dependency relationships as the source.
+  function rebuildClonedDependants(roots) {
+    var flatMap = buildFlatMap(roots, {});
+    Object.keys(flatMap).forEach(function (id) { flatMap[id].dependant_items = '{}'; });
+    Object.keys(flatMap).forEach(function (id) {
+      var item = flatMap[id];
+      var rc = parseRC(item.run_cond_config);
+      ['start', 'cycle', 'end'].forEach(function (phase) {
+        if (rc[phase] && rc[phase].values) {
+          rc[phase].values.forEach(function (valueId) {
+            if (flatMap[valueId]) _addToDependantList(flatMap, [valueId], item.item_id, phase);
+          });
+        }
+      });
+    });
+  }
+
+  // Mirror organize_rc_to_place_item_in_new_location for a pasted block:
+  // preserve its internal, remapped relationships and repair only the two
+  // boundaries where it joins the destination sibling list.
+  function organizePastedRoots(items, siblings, startIndex, count) {
+    if (!siblings || !count) return;
+    var flatMap = buildFlatMap(items, {});
+    var first = siblings[startIndex];
+    var before = startIndex > 0 ? siblings[startIndex - 1] : null;
+    var after = siblings[startIndex + count];
+
+    // The preceding destination item assigns its below item (the first paste)
+    // to start after it. If none exists, the first pasted root starts at zero.
+    if (before) organizeRcAfterChange(items, flatMap, before, true, false);
+    else if (first) organizeRcAfterChange(items, flatMap, first, false, true);
+
+    // The destination item below the pasted block starts after its new
+    // immediate predecessor. Do not alter the copied roots between boundaries.
+    if (after) organizeRcAfterChange(items, buildFlatMap(items, {}), after, false, true);
   }
 
   // Return the subset of activeItemIds that are "roots" of the selection:
@@ -746,6 +802,72 @@ sap.ui.getCore().attachInit(function () {
   var oSettingsModel   = new sap.ui.model.json.JSONModel({ scaleFactor: scaleFactor });
   var oDataModel       = new sap.ui.model.json.JSONModel({ items: [], maxCycleEnd: 0 });
   var oSelectedItemId  = null;   // item_id of the last clicked row
+  // Undo/redo is deliberately scoped to the current Op. History only contains
+  // unsaved client state, so Save becomes the new baseline.
+  var _opHistory = {};           // opNumber → { undo: [], redo: [] }
+  var _pendingItemDeletes = {};  // opNumber → item_ids to delete on Save
+  var _restoringHistory = false;
+  var _historyLimit = 75;
+
+  function _cloneHistoryValue(value) { return JSON.parse(JSON.stringify(value)); }
+  function _currentOpHistory() {
+    var op = oOpSelect && oOpSelect.getSelectedKey();
+    if (!op) return null;
+    if (!_opHistory[op]) _opHistory[op] = { undo: [], redo: [] };
+    return _opHistory[op];
+  }
+  function _captureHistorySnapshot() {
+    return {
+      items: _cloneHistoryValue(oDataModel.getProperty('/items') || []),
+      pendingDeleteIds: _cloneHistoryValue(_pendingItemDeletes[oOpSelect.getSelectedKey()] || []),
+      selectedItemId: oSelectedItemId,
+      activeItemIds: _cloneHistoryValue(oRcState.activeItemIds || [])
+    };
+  }
+  function _updateHistoryButtons() {
+    var h = _currentOpHistory();
+    if (typeof oUndoBtn !== 'undefined' && oUndoBtn) oUndoBtn.setEnabled(!!(h && h.undo.length));
+    if (typeof oRedoBtn !== 'undefined' && oRedoBtn) oRedoBtn.setEnabled(!!(h && h.redo.length));
+  }
+  // Call immediately before a mutation that the user can undo.
+  function beginHistoryAction() {
+    if (_restoringHistory) return;
+    var h = _currentOpHistory();
+    if (!h) return;
+    h.undo.push(_captureHistorySnapshot());
+    if (h.undo.length > _historyLimit) h.undo.shift();
+    h.redo = [];
+    _updateHistoryButtons();
+  }
+  function _restoreHistorySnapshot(snapshot) {
+    var op = oOpSelect.getSelectedKey();
+    _restoringHistory = true;
+    _pendingItemDeletes[op] = _cloneHistoryValue(snapshot.pendingDeleteIds || []);
+    oSelectedItemId = snapshot.selectedItemId || null;
+    oRcState.activeItemIds = _cloneHistoryValue(snapshot.activeItemIds || []);
+    oDataModel.setData({ items: _cloneHistoryValue(snapshot.items || []), maxCycleEnd: 0 });
+    recalcTree();
+    applyRowHighlight();
+    _restoringHistory = false;
+  }
+  function undoCurrentOp() {
+    var h = _currentOpHistory();
+    if (!h || !h.undo.length) return;
+    h.redo.push(_captureHistorySnapshot());
+    _restoreHistorySnapshot(h.undo.pop());
+    _updateHistoryButtons();
+  }
+  function redoCurrentOp() {
+    var h = _currentOpHistory();
+    if (!h || !h.redo.length) return;
+    h.undo.push(_captureHistorySnapshot());
+    _restoreHistorySnapshot(h.redo.pop());
+    _updateHistoryButtons();
+  }
+  function _resetOpHistory(op) {
+    if (op) _opHistory[op] = { undo: [], redo: [] };
+    _updateHistoryButtons();
+  }
   var oLastAddedItemId = null;   // item_id created by the most recent add — cleared on any manual click
 
   // RC interaction state
@@ -867,6 +989,25 @@ sap.ui.getCore().attachInit(function () {
     oRcEndCheck.setSelected(false);   setPhaseControlsEnabled('end',   false);
   }
 
+  function selectAllTreeItems() {
+    var allItems = flattenInOrder(oDataModel.getProperty('/items'));
+    if (!allItems.length) return;
+    oRcState.activeItemIds = allItems.map(function (item) { return item.item_id; });
+    oSelectedItemId = allItems[0].item_id;
+    _anchorItemId = oSelectedItemId;
+    var rc = parseRC(allItems[0].run_cond_config);
+    oActivePhases = [];
+    if (rc.start && rc.start.condition) oActivePhases.push('start');
+    if (rc.cycle && rc.cycle.condition) oActivePhases.push('cycle');
+    if (rc.end && rc.end.condition) oActivePhases.push('end');
+    if (!oActivePhases.length) oActivePhases = ['start', 'cycle'];
+    refreshRcToolbar(allItems[0]);
+    applyRowHighlight();
+    _syncCycleTypeSelect();
+    _showRcSigns(allItems[0]);
+    sap.m.MessageToast.show('Selected ' + allItems.length + ' tree item(s)');
+  }
+
   function applyWaitHighlights() {
     [oTable, oHomeTable].forEach(function (tbl) {
       if (!tbl) return;
@@ -965,6 +1106,7 @@ sap.ui.getCore().attachInit(function () {
     if (!oRcState.activeItemIds.length) { sap.m.MessageToast.show("Select a row first"); return; }
 
     function doApply() {
+      beginHistoryAction();
       var flatMap = buildFlatMap(oDataModel.getProperty("/items"), {});
       oRcState.activeItemIds.forEach(function (id) {
         var item = flatMap[id];
@@ -1131,6 +1273,7 @@ sap.ui.getCore().attachInit(function () {
       if (oSelectCtrl) oSelectCtrl.setSelectedKey('');
       return;
     }
+    beginHistoryAction();
 
     // Determine condition per phase + mode
     var cond;
@@ -1315,6 +1458,7 @@ sap.ui.getCore().attachInit(function () {
     var items = oDataModel.getProperty("/items");
     var roots = getClipboardRoots();
     if (!roots.length) return;
+    beginHistoryAction();
 
     // Snapshot clipboard first
     var idMap = {};
@@ -1357,6 +1501,11 @@ sap.ui.getCore().attachInit(function () {
     oSelectedItemId = null;
     oRcState.activeItemIds = [];
     recalcTree();
+    var pending = _pendingItemDeletes[oOpSelect.getSelectedKey()] || [];
+    Object.keys(cutIds).forEach(function (id) {
+      if (pending.indexOf(id) < 0) pending.push(id);
+    });
+    _pendingItemDeletes[oOpSelect.getSelectedKey()] = pending;
     sap.m.MessageToast.show("Cut " + clones.length + " item(s)");
   }
 
@@ -1366,6 +1515,7 @@ sap.ui.getCore().attachInit(function () {
     var items   = oDataModel.getProperty("/items");
     var refItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
     if (!refItem && mode !== 'subprocess') { sap.m.MessageToast.show("Select a row first"); return; }
+    beginHistoryAction();
 
     // Fresh clone each time so multi-paste gives independent items.
     // deepCloneWithNewIds recurses the full subtree, so the copy prefix is
@@ -1374,47 +1524,43 @@ sap.ui.getCore().attachInit(function () {
     var isCopyPaste = clipboard.mode === 'copy';
     var freshClones = clipboard.items.map(function (item) { return deepCloneWithNewIds(item, newIdMap, isCopyPaste); });
     freshClones.forEach(function (c) { remapRcRefs(c, newIdMap); });
+    rebuildClonedDependants(freshClones);
+    var pastedSiblings, pastedStartIndex;
 
     if (mode === 'subprocess' && !refItem) {
       // No row selected — paste as new top-level stations
       var op = oOpSelect.getSelectedKey();
+      pastedSiblings = items;
+      pastedStartIndex = items.length;
       freshClones.forEach(function (clone) {
         clone.parent_id = "";
         clone.op_number = op;
         items.push(clone);
       });
-      freshClones.forEach(function (clone) {
-        organizeRcAfterChange(items, buildFlatMap(items, {}), clone, false, false);
-      });
     } else if (mode === 'subprocess') {
       if (!Array.isArray(refItem.sub_process_items)) refItem.sub_process_items = [];
+      pastedSiblings = refItem.sub_process_items;
+      pastedStartIndex = pastedSiblings.length;
       freshClones.forEach(function (clone) {
         clone.parent_id = refItem.item_id;
         clone.op_number = refItem.op_number;
         refItem.sub_process_items.push(clone);
-      });
-      freshClones.forEach(function (clone) {
-        organizeRcAfterChange(items, buildFlatMap(items, {}), clone, false, false);
       });
     } else {
       var flatMap = buildFlatMap(items, {});
       var ctx     = getSiblingsContext(items, refItem, flatMap);
       if (ctx.idx < 0) { sap.m.MessageToast.show("Could not locate item"); return; }
       var insertIdx = mode === 'above' ? ctx.idx : ctx.idx + 1;
+      pastedSiblings = ctx.siblings;
+      pastedStartIndex = insertIdx;
       freshClones.forEach(function (clone, i) {
         clone.parent_id = refItem.parent_id || "";
         clone.op_number = refItem.op_number;
         ctx.siblings.splice(insertIdx + i, 0, clone);
       });
-      // Fix RC for each inserted clone and the item that follows the last one
-      freshClones.forEach(function (clone) {
-        organizeRcAfterChange(items, buildFlatMap(items, {}), clone, false, false);
-      });
-      var afterIdx = insertIdx + freshClones.length;
-      if (afterIdx < ctx.siblings.length) {
-        organizeRcAfterChange(items, buildFlatMap(items, {}), ctx.siblings[afterIdx], false, true);
-      }
     }
+
+    organizePastedRoots(items, pastedSiblings, pastedStartIndex, freshClones.length);
 
     oSelectedItemId        = freshClones[freshClones.length - 1].item_id;
     oRcState.activeItemIds = freshClones.map(function (c) { return c.item_id; });
@@ -1471,6 +1617,7 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
     if (!window.confirm('Do you want to move the selected process(es) to an upper level?')) return;
+    beginHistoryAction();
 
     var parent = move.flatMap[move.parentId];
     if (!parent) return;
@@ -1513,6 +1660,7 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
     if (!window.confirm('Do you want to move the selected process(es) to a lower level?')) return;
+    beginHistoryAction();
 
     var destination = newParent.sub_process_items || (newParent.sub_process_items = []);
     var insertAt = destination.length;
@@ -1553,6 +1701,7 @@ sap.ui.getCore().attachInit(function () {
 
     var label = idsToDelete.length === 1 ? '1 process' : idsToDelete.length + ' processes';
     if (!window.confirm('Delete ' + label + '?')) return;
+    beginHistoryAction();
 
     var items    = oDataModel.getProperty("/items");
     var flatMap0 = buildFlatMap(items, {});
@@ -1584,15 +1733,16 @@ sap.ui.getCore().attachInit(function () {
     clearRowHighlight();
     recalcTree();
 
+    // Defer persistence until Save. Include descendants because they were
+    // removed from the nested model along with each selected root.
+    var pending = _pendingItemDeletes[oOpSelect.getSelectedKey()] || [];
     idsToDelete.forEach(function (id) {
-      fetch(API_BASE + '/removeProcess', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ item_id: id })
-      })
-        .then(function (r) { console.log('[ValiantTMS] /removeProcess:', r.status); })
-        .catch(function (err) { console.warn('[ValiantTMS] /removeProcess error:', err.message); });
+      var removed = flatMap0[id];
+      collectAllItems(removed || { sub_process_items: [] }).forEach(function (item) {
+        if (pending.indexOf(item.item_id) < 0) pending.push(item.item_id);
+      });
     });
+    _pendingItemDeletes[oOpSelect.getSelectedKey()] = pending;
 
     sap.m.MessageToast.show(label.charAt(0).toUpperCase() + label.slice(1) + ' removed.');
   }
@@ -1604,6 +1754,7 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
     var items    = oDataModel.getProperty("/items");
+    beginHistoryAction();
     var currItem = oSelectedItemId ? findItemById(items, oSelectedItemId) : null;
 
     // If the selected item was itself just added by the previous click (not a
@@ -1686,6 +1837,7 @@ sap.ui.getCore().attachInit(function () {
   function addProcessAt(offset) { // offset 0 = above, 1 = below
     var items = oDataModel.getProperty("/items");
     if (!oSelectedItemId) { sap.m.MessageToast.show("Click a row first"); return; }
+    beginHistoryAction();
 
     var refItemId    = oSelectedItemId;
     var selectedItem = findItemById(items, refItemId);
@@ -1876,6 +2028,7 @@ sap.ui.getCore().attachInit(function () {
         op_number:               op,
         cycle_general_structure: stripClientFields(_tagOpNumber(items, op)),
         items_details:           _buildItemsDetailsPayload(op, items),
+        item_ids_to_delete:      (_pendingItemDeletes[op] || []).slice(),
         job_metadata:            _buildJobMetadata(op, items),
         project_metadata:        projectMeta,
         ops_to_delete:           idx === 0 ? opsToDeleteSnap     : [],
@@ -1898,6 +2051,10 @@ sap.ui.getCore().attachInit(function () {
 
     _opsToDelete     = [];
     _projectToDelete = [];
+    opKeys.forEach(function (op) {
+      _pendingItemDeletes[op] = [];
+      _resetOpHistory(op);
+    });
     sap.m.MessageToast.show("Saved");
   }
 
@@ -1939,6 +2096,7 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
 
+    beginHistoryAction();
     var flatMap = buildFlatMap(oDataModel.getProperty('/items'), {});
     var changed = 0;
     oRcState.activeItemIds.forEach(function (id) {
@@ -2417,6 +2575,7 @@ sap.ui.getCore().attachInit(function () {
       if (newTitle && newTitle !== rawTitle) {
         // Update the item inside the real model data by item_id
         var items   = oDataModel.getProperty("/items");
+        beginHistoryAction();
         var updated = findAndUpdateTitle(items, itemId, newTitle);
         if (updated) {
           console.log("[ValiantTMS] Model updated:", itemId, "→", newTitle);
@@ -3381,6 +3540,8 @@ sap.ui.getCore().attachInit(function () {
         annotateAncestors(items, []);
         maxCycleEnd = getMaxCycleEnd(items) || 500;
         _opTreeCache[opNumber] = JSON.parse(JSON.stringify(items));
+        _pendingItemDeletes[opNumber] = [];
+        _resetOpHistory(opNumber);
         oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
         _updateResourceUsageInCache(opNumber);
         updateGanttColumn();
@@ -3400,6 +3561,7 @@ sap.ui.getCore().attachInit(function () {
     annotateAncestors(items, []);
     maxCycleEnd = getMaxCycleEnd(items) || 500;
     oDataModel.setData({ items: items, maxCycleEnd: maxCycleEnd });
+    _updateHistoryButtons();
     _updateResourceUsageInCache(opNumber);
     updateGanttColumn();
     updateRuler();
@@ -3600,9 +3762,13 @@ sap.ui.getCore().attachInit(function () {
       _opMetaMap[opNum]         = _opMetaMap[oldNum]         || {};
       _opTreeCache[opNum]       = _opTreeCache[oldNum]        || [];
       _itemsDetailsCache[opNum] = _itemsDetailsCache[oldNum]  || {};
+      _opHistory[opNum]         = _opHistory[oldNum]          || { undo: [], redo: [] };
+      _pendingItemDeletes[opNum] = _pendingItemDeletes[oldNum] || [];
       delete _opMetaMap[oldNum];
       delete _opTreeCache[oldNum];
       delete _itemsDetailsCache[oldNum];
+      delete _opHistory[oldNum];
+      delete _pendingItemDeletes[oldNum];
       // Rename oldNum → opNum in every item title BEFORE setSelectedKey triggers _loadTreeFromCache
       (function _renameTitles(items) {
         (items || []).forEach(function (item) {
@@ -3620,24 +3786,9 @@ sap.ui.getCore().attachInit(function () {
       // Explicitly reload the tree so renamed titles appear immediately
       if (oOpSelect.getSelectedKey() === opNum) { _loadTreeFromCache(opNum); }
       _opDialogOrigNum = opNum;
-      // Immediately tell the backend to delete the old op and save under the new number
-      var treeItems    = _opTreeCache[opNum] || [];
-      var detailsCache = _itemsDetailsCache[opNum] || {};
-      var renamePayload = {
-        op_number:               opNum,
-        cycle_general_structure: treeItems,
-        items_details:           Object.keys(detailsCache).map(function (k) { return detailsCache[k]; }),
-        job_metadata:            _buildJobMetadata(opNum, treeItems),
-        project_metadata:        _buildProjectMetadata(),
-        ops_to_delete:           [oldNum]
-      };
-      fetch(API_BASE + "/updateDB", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify(renamePayload)
-      })
-        .then(function (r) { console.log("[ValiantTMS] /updateDB renameOp:", r.status); })
-        .catch(function (err) { console.warn("[ValiantTMS] /updateDB renameOp error:", err.message); });
+      // Keep the old operation pending for deletion until the user saves. A
+      // rename must not make an irreversible server change before Save.
+      if (_opsToDelete.indexOf(oldNum) < 0) _opsToDelete.push(oldNum);
     }
 
     _opMetaMap[opNum] = {
@@ -4273,6 +4424,14 @@ sap.ui.getCore().attachInit(function () {
     ]
   }).addStyleClass("vtOpSection");
 
+  var oUndoBtn = new sap.m.Button({
+    icon: 'sap-icon://undo', type: 'Transparent', enabled: false,
+    tooltip: 'Undo (Ctrl+Z)', press: undoCurrentOp
+  });
+  var oRedoBtn = new sap.m.Button({
+    icon: 'sap-icon://redo', type: 'Transparent', enabled: false,
+    tooltip: 'Redo (Ctrl+Shift+Z or Ctrl+Y)', press: redoCurrentOp
+  });
   var oTabBarSaveBtn = new sap.m.Button({
     icon:    "sap-icon://save",
     text:    "Save",
@@ -5606,6 +5765,8 @@ sap.ui.getCore().attachInit(function () {
       var opTitle = m.op_title || '—';
       var opSafe  = op.replace(/[^a-zA-Z0-9]/g, '_');
       var rowBg   = i % 2 === 0 ? '#fff' : '#f7f9fb';
+      var numOfParts = parseFloat(m.num_of_parts) || 1;
+      var opTarget   = Math.round(tct * numOfParts * 100) / 100;
       var stCount, ctUsed, statusCell;
 
       if (!tree) {
@@ -5619,13 +5780,13 @@ sap.ui.getCore().attachInit(function () {
         var ct   = Math.round(getMaxCycleEnd(tree) * 10) / 10;
         stCount  = stNum;
         ctUsed   = ct + ' s';
-        var over = tct > 0 && ct > tct;
+        var over = opTarget > 0 && ct > opTarget;
         if (over) {
           overTargetOps++;
           statusCell = '<span style="display:inline-flex;align-items:center;gap:4px;background:#fff0f0;color:#cc0000;'
                      + 'border:1px solid #f5c0c0;border-radius:4px;padding:2px 8px;font-weight:700;font-size:0.8rem;">'
                      + '&#9888; !</span>';
-        } else if (tct > 0) {
+        } else if (opTarget > 0) {
           statusCell = '<span style="display:inline-flex;align-items:center;background:#f0faf0;color:#1a7a1a;'
                      + 'border:1px solid #b0ddb0;border-radius:4px;padding:2px 8px;font-weight:600;font-size:0.8rem;">'
                      + '&#10003;</span>';
@@ -5644,7 +5805,7 @@ sap.ui.getCore().attachInit(function () {
             + '<td style="padding:8px 12px;color:#555;">' + opTitle + '</td>'
             + '<td style="padding:8px 12px;text-align:center;">' + stCount + '</td>'
             + '<td style="padding:8px 12px;text-align:center;font-weight:600;">' + ctUsed + '</td>'
-            + '<td style="padding:8px 12px;text-align:center;color:#666;">' + (tct ? tct + ' s' : '—') + '</td>'
+            + '<td style="padding:8px 12px;text-align:center;color:#666;">' + (opTarget ? opTarget + ' s' : '—') + '</td>'
             + '<td style="padding:8px 12px;text-align:center;">' + statusCell + '</td>'
             + '</tr>';
     });
@@ -6124,6 +6285,21 @@ sap.ui.getCore().attachInit(function () {
     });
   };
 
+  // Default the Plots tab to the job review. Per-op sections remain available
+  // on demand, but do not make the tab open as a long expanded list.
+  function _setStatsTabDefaultExpansion() {
+    var jobBody = document.getElementById('vtStatsSectionBody_job');
+    var jobChevron = document.getElementById('vtStatChevron_job');
+    if (jobBody) jobBody.classList.remove('vtCollapsed');
+    if (jobChevron) jobChevron.textContent = '▼';
+    document.querySelectorAll('#vtStatsOpSections .vtStatSectionBody').forEach(function (body) {
+      body.classList.add('vtCollapsed');
+    });
+    document.querySelectorAll('#vtStatsOpSections [id^="vtStatChevron_"]').forEach(function (chevron) {
+      chevron.textContent = '▶';
+    });
+  }
+
   window.vtScrollToOp = function (opSafe) {
     var el = document.getElementById('vtOpSection_' + opSafe);
     if (!el) return;
@@ -6244,6 +6420,7 @@ sap.ui.getCore().attachInit(function () {
     // Prefetch already ran on job select — uncached list will usually be empty
     if (!uncached.length) {
       _renderStatsTab();
+      _setStatsTabDefaultExpansion();
       return;
     }
     // Still loading (prefetch in progress or failed) — show progress and wait
@@ -6261,7 +6438,10 @@ sap.ui.getCore().attachInit(function () {
       });
     });
     chain
-      .then(function () { _renderStatsTab(); })
+      .then(function () {
+        _renderStatsTab();
+        _setStatsTabDefaultExpansion();
+      })
       .catch(function (err) {
         if (content) {
           content.innerHTML = '<em style="color:#cc0000;font-family:72,Arial,sans-serif;font-size:0.82rem;">'
@@ -6269,6 +6449,315 @@ sap.ui.getCore().attachInit(function () {
         }
       });
   }
+
+  // Build a portable, offline report entirely in the browser.  Deliberately use
+  // native SVG rather than Chart.js here: an exported report must not depend on
+  // a CDN or on the application being available when it is opened.
+  function _vtReportEscape(value) {
+    return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function _vtReportFlatten(items, output) {
+    (items || []).forEach(function (item) {
+      output.push(item);
+      _vtReportFlatten(item.sub_process_items, output);
+    });
+    return output;
+  }
+
+  function _vtReportImageDataUrl(url) {
+    if (!url || /^data:image\//i.test(url)) return Promise.resolve(url || '');
+    // A failed conversion is intentionally omitted.  Keeping its URL would make
+    // the downloaded document depend on the app server, defeating offline use.
+    return fetch(url).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.blob();
+    }).then(function (blob) {
+      return new Promise(function (resolve) {
+        var reader = new FileReader();
+        reader.onload = function () { resolve(reader.result); };
+        reader.onerror = function () { resolve(''); };
+        reader.readAsDataURL(blob);
+      });
+    }).catch(function () { return ''; });
+  }
+
+  function _vtCreateHtmlReportPayload(ops) {
+    var reportOps = ops.map(function (op) {
+      var details = JSON.parse(JSON.stringify(_itemsDetailsCache[op] || {}));
+      return {
+        number: op,
+        title: (_opMetaMap[op] || {}).op_title || '',
+        numOfParts: (_opMetaMap[op] || {}).num_of_parts || 1,
+        items: JSON.parse(JSON.stringify(_opTreeCache[op] || [])),
+        details: details
+      };
+    });
+    var imageJobs = [];
+    reportOps.forEach(function (op) {
+      Object.keys(op.details).forEach(function (itemId) {
+        var detail = op.details[itemId] || {};
+        var urls = String(detail.designer_picture_links || '').split(';').filter(Boolean);
+        imageJobs.push(Promise.all(urls.map(_vtReportImageDataUrl)).then(function (images) {
+          detail.embedded_images = images.filter(Boolean);
+        }));
+      });
+    });
+    return Promise.all(imageJobs).then(function () {
+      return _vtReportImageDataUrl('https://www.valianttms.com/wp-content/uploads/2021/09/valianttms-logo-298x92-1.png');
+    }).then(function (logo) {
+      return {
+        projectNumber: _jobState.job_number || '',
+        projectTitle: _jobState.job_title || '',
+        targetCycleTime: Number(_jobState.target_cycle_time) || 0,
+        generatedAt: new Date().toLocaleString(),
+        logo: logo,
+        ops: reportOps
+      };
+    });
+  }
+
+  function _vtBuildStandaloneHtmlReport(payload) {
+    // Escape '<' so project content cannot terminate the data script element.
+    var data = JSON.stringify(payload).replace(/</g, '\\u003c');
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+      + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+      + '<title>Cycle Chart Report</title><style>'
+      + ':root{--blue:#09528a;--ink:#243746;--line:#dce3e8}*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:var(--ink);font:14px Arial,sans-serif}.page{max-width:1500px;margin:auto;background:#fff;min-height:100vh;padding:24px}.header{display:flex;justify-content:space-between;gap:20px;border-left:12px solid var(--blue);padding:14px 18px;margin-bottom:20px;background:linear-gradient(90deg,#edf5fa,#fff)}h1{margin:0;color:var(--blue);font-size:28px}h2{margin:4px 0 0;font-size:19px}.meta{color:#51636f;margin-top:8px}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:16px 0}.toolbar select,.tab{font:inherit;border:1px solid #b9c8d2;border-radius:4px;padding:8px 12px;background:#fff}.tab{cursor:pointer}.tab.active{background:var(--blue);border-color:var(--blue);color:#fff}.panel{display:none}.panel.active{display:block}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin:16px 0}.card{border:1px solid var(--line);border-radius:8px;padding:14px;box-shadow:0 1px 4px #0000000d}.card h3{margin:0 0 10px;color:var(--blue);font-size:16px}.gantt{overflow-x:auto;border:1px solid var(--line);border-radius:7px;padding:8px}.gantt svg{min-width:800px;width:100%;display:block}.bar{cursor:pointer}.bar:hover{filter:brightness(.85)}table{border-collapse:collapse;width:100%;font-size:13px}th{background:var(--blue);color:#fff;text-align:left}th,td{padding:8px;border:1px solid var(--line);vertical-align:top}tr:nth-child(even){background:#f7fafc}.legend{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px}.legend span{display:flex;align-items:center;gap:5px}.swatch{width:12px;height:12px;border-radius:2px;display:inline-block}.modal{position:fixed;inset:0;background:#0008;z-index:10;display:none;padding:5vh 16px;overflow:auto}.modal.open{display:block}.modal-card{max-width:720px;margin:auto;background:#fff;border-radius:8px;padding:20px;position:relative}.close{position:absolute;right:12px;top:10px;border:0;background:none;font-size:24px;cursor:pointer}.images img{max-width:100%;max-height:420px;margin:8px 0;border:1px solid var(--line)}a{color:var(--blue);word-break:break-word}@media print{body{background:#fff}.page{max-width:none;padding:0}.toolbar{display:none}.panel{display:block!important;break-after:page}.panel:not(:first-of-type){margin-top:25px}.card{box-shadow:none}.modal{display:none!important}}@media(max-width:600px){.page{padding:12px}.header{display:block}h1{font-size:22px}}'
+      + '</style></head><body><main class="page"><table class="header-table" style="width:100%;border-collapse:collapse;margin-bottom:20px"><tr><td class="header-left" style="width:66%;padding:16px 22px;background:linear-gradient(90deg,#09528A 0%,#fff 100%);vertical-align:middle"><h1 class="title program-title" id="project" style="margin:0;color:#fff;font-size:28px">ValiantTMS Program</h1><h2 class="title job-title" id="opTitle" style="margin:6px 0;color:#fff;font-size:21px"></h2><h2 class="title cycle-time" id="targetTime" style="margin:4px 0;color:#fff;font-size:17px"></h2><h2 class="title cycle-time" id="calculatedTime" style="margin:4px 0;color:#fff;font-size:17px"></h2></td><td class="header-right" style="width:34%;padding:8px 18px;text-align:center;vertical-align:middle"><p id="reportLogo" style="margin:0"></p><h3 class="report-title" style="margin:4px 0;color:#09528A;font-size:20px">Cycle Chart Report</h3><h4 class="date-text" id="date" style="margin:2px 0;color:#09528A;font-size:14px"></h4></td></tr></table><div class="toolbar"><label>Operation <select id="opSelect"></select></label><button class="tab active" data-tab="chart">Cycle Chart</button><button class="tab" data-tab="summary">Plots</button><button class="tab" data-tab="table">Table</button></div><section id="chart" class="panel active"></section><section id="summary" class="panel"></section><section id="table" class="panel"></section></main><div id="modal" class="modal"><div class="modal-card"><button class="close" aria-label="Close">&times;</button><div id="modalContent"></div></div></div><script>const REPORT=' + data + ';(function(){'
+      + 'const $=s=>document.querySelector(s),esc=v=>String(v??\'\').replace(/[&<>"\']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\\"":"&quot;","\'":"&#39;"}[c])),n=v=>Math.round((Number(v)||0)*100)/100;const colors={"Machine cycle":"#05DF72","Robot cycle":"#EBDD6C","Manual cycle":"#EB1E29","Operator wait":"#1EC2EB","Station":"#8A4109","Process group":"#FFFFFF"};'
+      + 'function flat(a,o=[]){a.forEach(x=>{o.push(x);flat(x.sub_process_items||[],o)});return o}function sums(items){let out={"Machine cycle":0,"Manual cycle":0,"Robot cycle":0,"Operator wait":0};flat(items).forEach(x=>{if(x.cycle_type in out)out[x.cycle_type]+=Number(x.cycle_time)||0});return out}function resources(items){let o={};flat(items).filter(x=>!(x.sub_process_items||[]).length).forEach(x=>{let m=String(x.title||\'\').match(/"([^"]+)"/g)||[];m.forEach(q=>{let k=q.slice(1,-1);o[k]=(o[k]||0)+(Number(x.cycle_time)||0)})});return o}'
+      + 'function bars(obj){let p=Object.entries(obj).filter(x=>x[1]);if(!p.length)return "<p>No data available.</p>";let mx=Math.max(...p.map(x=>x[1]),1),h=42*p.length+30;return `<svg viewBox="0 0 650 ${h}" role="img">${p.map(([k,v],i)=>`<text x="0" y="${35+i*42}" font-size="13">${esc(k)}</text><rect x="185" y="${20+i*42}" width="${430*v/mx}" height="22" fill="#09528a" rx="3"/><text x="${190+430*v/mx}" y="36" font-size="12">${n(v)}s</text>`).join(\'\')}</svg>`}'
+      + 'function donut(used,target){let rem=Math.max(target-used,0),total=Math.max(used+rem,1),p=used/total,off=100-p*100;return `<div style="display:flex;align-items:center;gap:12px"><svg viewBox="0 0 42 42" width="130" aria-label="cycle time"><circle cx="21" cy="21" r="15.9" fill="none" stroke="#e5e7eb" stroke-width="5"/><circle cx="21" cy="21" r="15.9" fill="none" stroke="#09528a" stroke-width="5" pathLength="100" stroke-dasharray="${p*100} ${off}" transform="rotate(-90 21 21)"/><text x="21" y="22" text-anchor="middle" font-size="4">${n(used)}s</text></svg><div><b>${n(used)}s used</b><br>${n(rem)}s remaining</div></div>`}'
+      + 'function stationPlots(op,target){let stations=op.items||[];if(!stations.length)return "";return `<h2 style="color:#09528A;font-size:18px;margin:28px 0 4px">Station Plots</h2>${stations.map(st=>{let used=Number(st.cycle_time)||0,children=st.sub_process_items||[],label=esc((st.step||"Station")+" — "+(st.title||""));return `<details class="card" open style="margin:12px 0"><summary style="cursor:pointer;font-weight:600;color:#32363a">${label}</summary><div class="cards"><div class="card"><h3>Cycle Time</h3>${donut(used,target)}</div><div class="card"><h3>Cycle Type</h3>${bars(sums(children))}</div><div class="card"><h3>Resource Usage</h3>${bars(resources(children))}</div></div></details>`}).join(\'\')}`}'
++ 'function gantt(op,rows){let max=Math.max(...rows.map(x=>Number(x.cycle_end)||0),1),left=270,w=920,cap=Math.max(18,Math.floor((left-18)/6)),byId=Object.fromEntries(rows.map(x=>[x.item_id,x])),wrap=(text,max)=>{let lines=[],line="";String(text||"").split(/\\s+/).forEach(word=>{let next=line?(line+" "+word):word;if(line&&next.length>max){lines.push(line);line=word}else line=next});if(line)lines.push(line);return lines},data=rows.map(x=>{let title=String(x.title||""),lines=title.length>cap?[String(x.step||"")+">"] .concat(wrap(title,cap)):[String(x.step||"")+"> "+title],rh=Math.max(30,lines.length*12+8),ends=[],parent=byId[x.parent_id];while(parent){ends.push(Number(parent.cycle_end)||0);parent=byId[parent.parent_id]}let level=String(x.step||"").split("_").length,labelColor=({1:"#8A4109",2:"#193CB8",3:"#1447E6",4:"#098A81",5:"#8A0912",6:"#8A8109",7:"#4A5565"})[level]||"#9F9FA9";return{x,lines,rh,ends,depth:ends.length,level,labelColor,labelWeight:level<=2?"bold":"normal",labelStyle:level>=3?"italic":"normal",isParent:!!((x.sub_process_items||[]).length)}}),h=Math.max(80,35+data.reduce((sum,row)=>sum+row.rh,0)),y=24;return `<style>.page{width:100%;max-width:none;margin:0}.gantt{width:100%;text-align:left}.gantt svg{min-width:${left+w}px}</style><div class="legend">${Object.entries(colors).map(([k,c])=>`<span><i class="swatch" style="background:${c};border:${k==="Process group"?"1px dashed #16394f":"none"}"></i>${k}</span>`).join(\'\')}</div><div class="gantt"><svg viewBox="0 0 ${left+w} ${h}">${data.map(row=>{let x=row.x,top=y,labelX=8+row.depth*16;y+=row.rh;let start=(Number(x.cycle_start)||0)/max*w,width=Math.max((Number(x.cycle_time)||0)/max*w,2),barX=left+start,barY=top+(row.rh-16)/2,c=colors[x.cycle_type]||"#9ca3af",stroke=x.cycle_type==="Process group"?"#16394f":c,bar=row.isParent?`<path class="bar" data-id="${esc(x.item_id)}" d="M ${barX} ${barY+16} V ${barY} H ${barX+width} V ${barY+16}" fill="none" stroke="${stroke}" stroke-width="2" stroke-dasharray="5 3"/>`:`<rect class="bar" data-id="${esc(x.item_id)}" x="${barX}" y="${barY}" width="${width}" height="16" rx="1" fill="${c}" stroke="#16394f"/>`,markers=row.ends.filter(Boolean).map(end=>`<line x1="${left+end/max*w}" x2="${left+end/max*w}" y1="${top}" y2="${top+row.rh}" stroke="#a7b0b8" stroke-width=".7" stroke-dasharray="3 2"/>`).join(\'\');return `<text x="${labelX}" y="${top+11}" font-size="10" fill="${row.labelColor}" font-weight="${row.labelWeight}" font-style="${row.labelStyle}">${row.lines.map((line,i)=>`<tspan x="${labelX}" dy="${i?12:0}">${esc(row.level===1?line.toUpperCase():line)}</tspan>`).join(\'\')}</text>${row.isParent?"":`<line x1="${left}" x2="${left+w}" y1="${top+row.rh}" y2="${top+row.rh}" stroke="#edf0f2"/>`}${markers}${bar}<text x="${barX+width+3}" y="${barY+12}" font-size="9" fill="#808080" font-style="italic">${n(x.cycle_time)}s/${n(x.cycle_end)}s</text>`}).join(\'\')}</svg></div>`}'
++ 'function render(){let op=REPORT.ops.find(x=>x.number===$("#opSelect").value)||REPORT.ops[0],rows=flat(op.items),used=Math.max(0,...rows.map(x=>Number(x.cycle_end)||0)),target=REPORT.targetCycleTime*(Number(op.numOfParts)||1),sum=sums(op.items),res=resources(op.items);$("#project").textContent=`ValiantTMS Program #${REPORT.projectNumber}${REPORT.projectTitle?" - "+REPORT.projectTitle:""}`;$("#opTitle").innerHTML=`<i>${esc(op.number)}</i>`;$("#targetTime").innerHTML=`Target Cycle Time: <i>${n(target)} Sec</i>`;$("#calculatedTime").innerHTML=`Calculated Cycle Time: <i>${n(used)} Sec</i>`;$("#date").innerHTML=`<i>${REPORT.generatedAt}</i>`;$("#reportLogo").innerHTML=REPORT.logo?`<img src="${REPORT.logo}" width="300" alt="ValiantTMS">`:"";$("#chart").innerHTML=`<div class="cards"><div class="card"><h3>${esc(op.number)} ${op.title?"— "+esc(op.title):""}</h3><p>Target Cycle Time: <b>${n(target)}s</b> &nbsp; Calculated Cycle Time: <b>${n(used)}s</b></p></div></div>${gantt(op,rows)}`;$("#summary").innerHTML=`<div class="cards"><div class="card"><h3>Used vs Remaining Cycle Time</h3>${donut(used,target)}</div><div class="card"><h3>Cycle Type Summary</h3>${bars(sum)}</div><div class="card"><h3>Resource Usage</h3>${bars(res)}</div></div>${stationPlots(op,target)}`;$("#table").innerHTML=`<table><thead><tr><th>Step / Title</th><th>Start</th><th>Cycle Time</th><th>End</th><th>Type</th><th>Run Condition</th></tr></thead><tbody>${rows.map(x=>{let level=String(x.step||"").split("_").length,color=({1:"#8A4109",2:"#193CB8",3:"#1447E6",4:"#098A81",5:"#8A0912",6:"#8A8109",7:"#4A5565"})[level]||"#9F9FA9",weight=level<=2?"bold":"normal",fontStyle=level>=3?"italic":"normal",label=(x.step||"")+"> "+(x.title||"");return `<tr><td style="color:${color};font-weight:${weight};font-style:${fontStyle}">${esc(level===1?label.toUpperCase():label)}</td><td>${n(x.cycle_start)}s</td><td>${n(x.cycle_time)}s</td><td>${n(x.cycle_end)}s</td><td>${esc(x.cycle_type)}</td><td style="white-space:normal;word-break:break-word;min-width:240px">${organizedRunCondition(op,x)}</td></tr>`}).join(\'\')}</tbody></table>`;document.querySelectorAll(".bar").forEach(b=>{let item=rows.find(x=>x.item_id===b.dataset.id);b.onclick=()=>popupDetail(op,item);b.onmouseenter=e=>showHover(op,item,e);b.onmousemove=e=>showHover(op,item,e);b.onmouseleave=hideHover})}'
++ 'function showHover(op,item,event){let tip=document.getElementById("vtReportHover");if(!tip){tip=document.createElement("div");tip.id="vtReportHover";tip.style.cssText="position:fixed;z-index:10000;display:none;max-width:420px;padding:10px 12px;background:#DAE1E8;border:1px solid darkblue;border-radius:4px;color:#111;font:13px Arial,sans-serif;line-height:1.45;box-shadow:0 3px 12px #0004;pointer-events:none";document.body.appendChild(tip)}tip.innerHTML=`<b>${esc((item.step||"")+"> "+(item.title||""))}</b><br><br><b>Start:</b> <i>${n(item.cycle_start)}s</i><br><b>End:</b> <i>${n(item.cycle_end)}s</i><br><b>Cycle Time:</b> <i>${n(item.cycle_time)}s</i><br><b>Type:</b> <i>${esc(item.cycle_type)}</i><br><b>Run Condition:</b><br><i>${organizedRunCondition(op,item)}</i>`;tip.style.display="block";tip.style.left=(event.clientX+14)+"px";tip.style.top=(event.clientY+14)+"px"}function hideHover(){let tip=document.getElementById("vtReportHover");if(tip)tip.style.display="none"}function organizedRunCondition(op,item){let cfg;try{cfg=JSON.parse(item.run_cond_config||"{}")}catch(e){return esc(item.run_cond_config||"")}let map=Object.fromEntries(flat(op.items).map(x=>[x.item_id,x]));return Object.keys(cfg).map(phase=>{let section=cfg[phase]||{},condition="",values=[],offset="";Object.keys(section).forEach(key=>{let value=section[key];if(key==="Offset"&&value&&value.length)offset=`(${value[0]}s offset)`;else{condition=key;values=Array.isArray(value)?value:[]}});if(!phase||!condition)return "";let titles=values.map(id=>{let ref=map[id],label=ref?`${ref.step||""}> ${ref.title||""}`:id;return `&nbsp;&nbsp;&nbsp;${esc(label)}`}).join("<br>"),heading=(phase==="Start"||phase==="End")?`${esc(phase)} ${esc(condition)} ${esc(offset)}`:`${esc(phase)} time: (${esc(condition)} ${esc(offset)})`;return `<b>${heading}</b><br><i>${titles}</i><br><br>`}).join("")}function popupDetail(op,item){let d=op.details[item.item_id]||{},map=Object.fromEntries(flat(op.items).map(x=>[x.item_id,x])),root=item,parent=map[root.parent_id];while(parent){root=parent;parent=map[root.parent_id]}let links=String(d.designer_resources_links||"").split(/\\r?\\n/).filter(Boolean),imgs=d.embedded_images||[],win=window.open("","_blank","width=500,height=600,scrollbars=yes");if(!win)return;let linksHtml=links.length?links.map(link=>`<p><a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a></p>`).join(""):"<p>No links available</p>",picturesHtml=imgs.length?imgs.map(img=>`<p><img src="${img}" width="500" alt="Mechanical design reference"></p>`).join(""):"<p></p>",html=`<!doctype html><html><head><meta charset="utf-8"><title>Process Details</title><style>body{font-family:Arial,sans-serif;padding:20px;background:#f8f9fa}h2{color:#2c3e50}table{border-collapse:collapse;width:100%;margin-top:15px}td{border:1px solid #ccc;padding:8px 12px}tr:nth-child(even){background:#eee}a{word-break:break-word}</style></head><body><h2>${esc((item.step||"")+"> "+(item.title||""))}</h2><table><tr><td><b>Station</b></td><td><i>${esc(root.title||"")}</i></td></tr><tr><td><b>Cycle Type</b></td><td><i>${esc(item.cycle_type)}</i></td></tr><tr><td><b>Run Condition</b></td><td>${organizedRunCondition(op,item)}</td></tr><tr><td><b>Start Time(s)</b></td><td><i>${n(item.cycle_start)}</i></td></tr><tr><td><b>End Time(s)</b></td><td><i>${n(item.cycle_end)}</i></td></tr><tr><td><b>Cycle Time(s)</b></td><td><i>${n(item.cycle_time)}</i></td></tr></table><h2>Mechanical Design:</h2><h4>Comments:</h4><p><i>${esc(d.designer_comments==="NULL"?"":d.designer_comments||"")}</i></p><h4>Links:</h4>${linksHtml}<h4>Pictures:</h4>${picturesHtml}</body></html>`;win.document.write(html);win.document.close()};$("#project").textContent=`Program #${REPORT.projectNumber}${REPORT.projectTitle?" — "+REPORT.projectTitle:""}`;$("#date").textContent="Generated: "+REPORT.generatedAt;$("#opSelect").innerHTML=REPORT.ops.map(o=>`<option value="${esc(o.number)}">${esc(o.number)}${o.title?" — "+esc(o.title):""}</option>`).join(\'\');$("#opSelect").onchange=render;document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab,.panel").forEach(x=>x.classList.remove("active"));b.classList.add("active");$("#"+b.dataset.tab).classList.add("active")});render()})();<\/script></body></html>';
+  }
+
+  // PDF export intentionally captures the rendered UI rather than recreating
+  // charts in a second format.  That keeps the PDF plots and screenshots in
+  // sync with the Statistics & Report tab.
+  function _vtPdfWait(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function _vtPdfCapture(element) {
+    if (!element) return Promise.resolve('');
+    // UI5 can resize Chart.js canvases while html2canvas is walking the DOM.
+    // A zero-size canvas then makes drawImage throw. The report adds its plots
+    // as native SVG below, so exclude all live canvases from screenshots.
+    var ignored = [];
+    Array.prototype.forEach.call(element.querySelectorAll('canvas'), function (canvas) {
+      var rect = canvas.getBoundingClientRect();
+      ignored.push({ canvas: canvas, previous: canvas.getAttribute('data-html2canvas-ignore') });
+      canvas.setAttribute('data-html2canvas-ignore', 'true');
+    });
+    function restoreIgnored() {
+      ignored.forEach(function (entry) {
+        if (entry.previous === null) entry.canvas.removeAttribute('data-html2canvas-ignore');
+        else entry.canvas.setAttribute('data-html2canvas-ignore', entry.previous);
+      });
+    }
+    return window.html2pdf().set({
+      html2canvas: {
+        backgroundColor: '#ffffff', scale: 1.25, useCORS: true, logging: false,
+        windowWidth: Math.max(element.scrollWidth || 0, element.clientWidth || 0, 1000),
+        windowHeight: Math.max(element.scrollHeight || 0, element.clientHeight || 0, 700)
+      }
+    }).from(element).toCanvas().get('canvas').then(function (canvas) {
+      restoreIgnored();
+      return canvas.toDataURL('image/png');
+    }, function (error) {
+      restoreIgnored();
+      throw error;
+    });
+  }
+
+  function _vtPdfComments(op) {
+    var details = _itemsDetailsCache[op] || {};
+    var comments = [];
+    Object.keys(details).forEach(function (itemId) {
+      var d = details[itemId] || {};
+      ['designer_comments', 'control_comments'].forEach(function (field) {
+        var value = String(d[field] || '').trim();
+        if (value && value !== 'NULL') {
+          comments.push({ item: d.step || d.item_title || itemId, label: field === 'designer_comments' ? 'Designer' : 'Controls', value: value });
+        }
+      });
+    });
+    return comments;
+  }
+
+  function _vtPdfPage(title) {
+    var page = document.createElement('section');
+    page.className = 'vtPdfPage';
+    var heading = document.createElement('h1');
+    heading.textContent = title;
+    page.appendChild(heading);
+    return page;
+  }
+
+  function _vtPdfBarPlot(title, values) {
+    var pairs = Object.keys(values || {}).map(function (key) { return [key, Math.round((Number(values[key]) || 0) * 100) / 100]; })
+      .filter(function (pair) { return pair[1] > 0; });
+    var wrap = document.createElement('div');
+    wrap.className = 'vtPdfNativePlot';
+    var heading = document.createElement('h3'); heading.textContent = title; wrap.appendChild(heading);
+    if (!pairs.length) {
+      var empty = document.createElement('p'); empty.textContent = 'No data available.'; wrap.appendChild(empty); return wrap;
+    }
+    var max = Math.max.apply(null, pairs.map(function (pair) { return pair[1]; }).concat([1]));
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg'); svg.setAttribute('viewBox', '0 0 960 ' + (pairs.length * 48 + 20)); svg.setAttribute('class', 'vtPdfBarSvg');
+    pairs.forEach(function (pair, index) {
+      var y = 10 + index * 48;
+      var label = document.createElementNS(ns, 'text'); label.setAttribute('x', '0'); label.setAttribute('y', String(y + 18)); label.setAttribute('font-size', '16'); label.textContent = pair[0]; svg.appendChild(label);
+      var bar = document.createElementNS(ns, 'rect'); bar.setAttribute('x', '255'); bar.setAttribute('y', String(y)); bar.setAttribute('width', String(620 * pair[1] / max)); bar.setAttribute('height', '26'); bar.setAttribute('rx', '4'); bar.setAttribute('fill', '#09528A'); svg.appendChild(bar);
+      var value = document.createElementNS(ns, 'text'); value.setAttribute('x', String(265 + 620 * pair[1] / max)); value.setAttribute('y', String(y + 18)); value.setAttribute('font-size', '15'); value.setAttribute('fill', '#32363a'); value.textContent = pair[1] + ' s'; svg.appendChild(value);
+    });
+    wrap.appendChild(svg); return wrap;
+  }
+
+  function _vtPdfAddImage(page, dataUrl, alt) {
+    if (!dataUrl) return;
+    var image = document.createElement('img');
+    image.src = dataUrl;
+    image.alt = alt;
+    image.className = 'vtPdfScreenshot';
+    page.appendChild(image);
+  }
+
+  window.vtExportPdf = function () {
+    var btn = document.getElementById('vtExportPdfBtn');
+    var status = document.getElementById('vtRptStatus');
+    var ops = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
+    if (!ops.length) { sap.m.MessageToast.show('Load a project before exporting a report.'); return; }
+    if (!window.html2pdf) { sap.m.MessageToast.show('The PDF library did not load. Check your network connection and try again.'); return; }
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Generating PDF...'; }
+    if (status) { status.style.display = 'block'; status.style.background = '#eaf3fb'; status.style.color = '#09528A'; status.textContent = 'Preparing report pages and screenshots...'; }
+
+    var missing = ops.filter(function (op) { return !_opTreeCache[op]; });
+    var load = Promise.resolve();
+    missing.forEach(function (op) { load = load.then(function () { return _fetchTreeToCache(op); }); });
+
+    load.then(function () {
+      _renderStatsTab();
+      return _vtPdfWait(700);
+    }).then(function () {
+      // The Design tab is briefly activated to capture the actual cycle-chart
+      // layout.  The report tab is restored before the PDF is assembled.
+      oIconTabBar.setSelectedKey('design');
+      oTable.invalidate();
+      return _vtPdfWait(350);
+    }).then(function () {
+      return _vtPdfCapture(oDesignLayout.getDomRef() || oTable.getDomRef());
+    }).then(function (layoutShot) {
+      oIconTabBar.setSelectedKey('stats');
+      return _vtPdfWait(350).then(function () { return { layoutShot: layoutShot, overviewShot: null }; });
+    }).then(function (shots) {
+      return _vtPdfCapture(document.getElementById('vtRptContent')).then(function (overviewShot) {
+        shots.overviewShot = overviewShot;
+        return Promise.all(ops.map(function (op) {
+          var safe = op.replace(/[^a-zA-Z0-9]/g, '_');
+          return _vtPdfCapture(document.getElementById('vtOpSection_' + safe)).then(function (shot) {
+            return { op: op, shot: shot };
+          });
+        })).then(function (opShots) { shots.opShots = opShots; return shots; });
+      });
+    }).then(function (shots) {
+      var report = document.createElement('div');
+      report.id = 'vtPdfReport';
+      report.style.cssText = 'position:fixed;left:-20000px;top:0;width:1120px;background:#fff;color:#32363a;font-family:Arial,sans-serif;padding:0;z-index:-1;';
+
+      var cover = _vtPdfPage('Cycle Chart Report');
+      cover.classList.add('vtPdfCover');
+      var logo = document.createElement('img');
+      logo.src = 'https://www.valianttms.com/wp-content/uploads/2021/09/valianttms-logo-298x92-1.png';
+      logo.alt = 'Valiant TMS logo'; logo.className = 'vtPdfLogo'; cover.appendChild(logo);
+      var job = document.createElement('p');
+      job.className = 'vtPdfJob';
+      job.textContent = 'Job Number: ' + (_jobState.job_number || '—') + (_jobState.job_title ? ' — ' + _jobState.job_title : '');
+      cover.appendChild(job);
+      var generated = document.createElement('p');
+      generated.className = 'vtPdfMeta'; generated.textContent = 'Generated: ' + new Date().toLocaleString(); cover.appendChild(generated);
+      var layoutLabel = document.createElement('h2'); layoutLabel.textContent = 'Cycle Chart Layout'; cover.appendChild(layoutLabel);
+      _vtPdfAddImage(cover, shots.layoutShot, 'Cycle chart layout screenshot');
+      report.appendChild(cover);
+
+      var overview = _vtPdfPage('Operation Overview');
+      var overviewText = document.createElement('p');
+      overviewText.textContent = 'Job summary and operation list.'; overview.appendChild(overviewText);
+      _vtPdfAddImage(overview, shots.overviewShot, 'Operation overview screenshot');
+      report.appendChild(overview);
+
+      shots.opShots.forEach(function (entry) {
+        var meta = _opMetaMap[entry.op] || {};
+        var page = _vtPdfPage('Operation ' + entry.op + (meta.op_title ? ' — ' + meta.op_title : ''));
+        var comments = _vtPdfComments(entry.op);
+        var commentHeading = document.createElement('h2'); commentHeading.textContent = 'Comments'; page.appendChild(commentHeading);
+        if (!comments.length) {
+          var empty = document.createElement('p'); empty.textContent = 'No comments available.'; page.appendChild(empty);
+        } else {
+          var list = document.createElement('ul'); list.className = 'vtPdfComments';
+          comments.forEach(function (comment) {
+            var item = document.createElement('li');
+            item.textContent = comment.item + ' (' + comment.label + '): ' + comment.value;
+            list.appendChild(item);
+          });
+          page.appendChild(list);
+        }
+        var plotHeading = document.createElement('h2'); plotHeading.textContent = 'Cycle-Time and Resource Plots'; page.appendChild(plotHeading);
+        _vtPdfAddImage(page, entry.shot, 'Operation ' + entry.op + ' report screenshot');
+        var items = _opTreeCache[entry.op] || [];
+        page.appendChild(_vtPdfBarPlot('Cycle Type Summary', _computeCycleTypeSums(items)));
+        var usage = _extractLeafResourceUsage(items);
+        page.appendChild(_vtPdfBarPlot('Resource Usage', usage));
+        report.appendChild(page);
+      });
+
+      document.body.appendChild(report);
+      var safe = ((_jobState.job_number || 'cycle_chart') + '_' + (_jobState.job_title || 'report')).replace(/[\\/:*?"<>|]+/g, '_').trim();
+      return window.html2pdf().set({
+        margin: [8, 8, 8, 8],
+        filename: safe + '_cycle_chart_report.pdf',
+        image: { type: 'jpeg', quality: 0.95 },
+        html2canvas: { scale: 1.5, useCORS: true, backgroundColor: '#ffffff' },
+        jsPDF: { unit: 'mm', format: 'a4', orientation: 'landscape' },
+        pagebreak: { mode: ['css', 'legacy'], before: '.vtPdfPage' }
+      }).from(report).save().then(function () { report.remove(); });
+    }).then(function () {
+      if (status) { status.style.background = '#f0faf0'; status.style.color = '#1a7a1a'; status.textContent = 'PDF report downloaded.'; }
+    }).catch(function (err) {
+      var leftover = document.getElementById('vtPdfReport'); if (leftover) leftover.remove();
+      if (status) { status.style.background = '#fff0f0'; status.style.color = '#cc0000'; status.textContent = 'PDF export error: ' + err.message; }
+      sap.m.MessageToast.show('PDF export failed: ' + err.message);
+    }).finally(function () { if (btn) { btn.disabled = false; btn.textContent = 'Generate PDF'; } });
+  };
+
+  window.vtExportHtml = function () {
+    var btn = document.getElementById('vtExportHtmlBtn');
+    var status = document.getElementById('vtRptStatus');
+    var ops = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
+    if (!ops.length) { sap.m.MessageToast.show('Load a project before exporting a report.'); return; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Preparing...'; }
+    if (status) { status.style.display='block'; status.style.background='#eaf3fb'; status.style.color='#09528A'; status.textContent='Preparing offline HTML report...'; }
+    var missing = ops.filter(function (op) { return !_opTreeCache[op]; });
+    var load = Promise.resolve();
+    missing.forEach(function (op) { load = load.then(function () { return _fetchTreeToCache(op); }); });
+    load.then(function () { return _vtCreateHtmlReportPayload(ops); })
+      .then(function (payload) {
+        var blob = new Blob([_vtBuildStandaloneHtmlReport(payload)], { type: 'text/html;charset=utf-8' });
+        var safe = (payload.projectNumber + '_' + payload.projectTitle).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'cycle_chart_report';
+        var link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = safe + '_cycle_chart_report.html';
+        document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(link.href);
+        if (status) { status.style.background='#f0faf0'; status.style.color='#1a7a1a'; status.textContent='Offline HTML report downloaded.'; }
+      })
+      .catch(function (err) { if (status) { status.style.background='#fff0f0'; status.style.color='#cc0000'; status.textContent='Error: ' + err.message; } sap.m.MessageToast.show('HTML export failed: ' + err.message); })
+      .finally(function () { if (btn) { btn.disabled = false; btn.textContent = 'Export HTML'; } });
+  };
 
   window.vtExportExcel = function () {
     var btn    = document.getElementById('vtExportExcelBtn');
@@ -6325,7 +6814,9 @@ sap.ui.getCore().attachInit(function () {
                 '<div style="display:flex;gap:6px;align-items:center;">',
                   '<button onclick="vtExpandAll()" style="padding:4px 12px;background:#f5f7fa;color:#32363a;border:1px solid #d0d0d0;border-radius:4px;font-size:0.78rem;font-family:72,Arial,sans-serif;cursor:pointer;" title="Expand all sections">Expand All</button>',
                   '<button onclick="vtCollapseAll()" style="padding:4px 12px;background:#f5f7fa;color:#32363a;border:1px solid #d0d0d0;border-radius:4px;font-size:0.78rem;font-family:72,Arial,sans-serif;cursor:pointer;" title="Collapse all sections">Collapse All</button>',
+                  '<button id="vtExportPdfBtn" onclick="vtExportPdf()" style="padding:5px 16px;background:#bb0000;color:#fff;border:none;border-radius:4px;font-size:0.82rem;font-family:72,Arial,sans-serif;cursor:pointer;font-weight:600;">Generate PDF</button>',
                   '<button id="vtExportExcelBtn" onclick="vtExportExcel()" style="padding:5px 16px;background:#09528A;color:#fff;border:none;border-radius:4px;font-size:0.82rem;font-family:72,Arial,sans-serif;cursor:pointer;font-weight:600;">Export Excel</button>',
+                  '<button id="vtExportHtmlBtn" onclick="vtExportHtml()" style="padding:5px 16px;background:#107e3e;color:#fff;border:none;border-radius:4px;font-size:0.82rem;font-family:72,Arial,sans-serif;cursor:pointer;font-weight:600;">Export HTML</button>',
                 '</div>',
               '</div>',
 
@@ -6374,7 +6865,7 @@ sap.ui.getCore().attachInit(function () {
   var oPage = new sap.m.Page({
     showNavButton: false,
     customHeader: new sap.m.Bar({
-      contentLeft:  [oJobHBox, oOpHBox, oTabBarSaveBtn],
+      contentLeft:  [oJobHBox, oOpHBox, oUndoBtn, oRedoBtn, oTabBarSaveBtn],
       contentRight: [
         new sap.m.Text({ text: "ValiantTMS — Cycle Chart Management", wrapping: false })
           .addStyleClass("vtPageTitle"),
@@ -6466,6 +6957,15 @@ sap.ui.getCore().attachInit(function () {
     if (e.key === 'Delete') { e.preventDefault(); removeProcess(); return; }
     if (e.shiftKey && e.key === 'P') { e.preventDefault(); addNewProcess(); return; }
     var mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault();
+      if (e.shiftKey) redoCurrentOp(); else undoCurrentOp();
+      return;
+    }
+    if (mod && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); redoCurrentOp(); return; }
+    if (mod && (e.key === 'a' || e.key === 'A') && oIconTabBar.getSelectedKey() === 'design') {
+      e.preventDefault(); selectAllTreeItems(); return;
+    }
     if (mod && e.key === 'c') { e.preventDefault(); copyToClipboard(); }
     if (mod && e.key === 'x') { e.preventDefault(); cutToClipboard(); }
     if (mod && e.key === 'v') { e.preventDefault(); pasteFromClipboard('subprocess'); }
