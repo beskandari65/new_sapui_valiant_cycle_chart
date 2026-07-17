@@ -16,6 +16,7 @@ import time
 import re
 import datetime
 import sqlite3
+import uuid
 
 try:
     import xlsxwriter as _xlw
@@ -24,6 +25,7 @@ except ImportError:
     _HAS_XLSXWRITER = False
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MiB per image
 
 # ── Excel export constants ────────────────────────────────────────────────────
 _THEME_COLOR = '#09528A'
@@ -637,13 +639,15 @@ def api_update_project_numbers():
             if op and op not in op_numbers_map[pn]:
                 op_numbers_map[pn].append(op)
 
-        if op_numbers_map:
-            proj_nos = list(op_numbers_map.keys())
-            ph = ",".join("?" * len(proj_nos))
-            for row in conn.execute(
-                f"SELECT * FROM project_metadata WHERE project_no IN ({ph})", proj_nos
-            ).fetchall():
-                project_meta_map[row["project_no"]] = dict(row)
+        # project_metadata is the source of truth for jobs.  A newly-created job
+        # does not necessarily have an operation (and therefore has no row in
+        # cycle_general_structure) yet, but it must still be returned after Save.
+        for row in conn.execute(
+            "SELECT * FROM project_metadata ORDER BY project_no"
+        ).fetchall():
+            project_no = row["project_no"]
+            project_meta_map[project_no] = dict(row)
+            op_numbers_map.setdefault(project_no, [])
 
         conn.close()
     else:
@@ -994,6 +998,7 @@ def _ensure_project_number_col(conn):
         conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN project_number TEXT DEFAULT ''")
         conn.commit()
     # Migrate: add columns introduced after the initial schema
+    _ensure_items_details_table(conn)
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(items_details)")}
     for col, defn in [
         ("control_comments",        "TEXT"),
@@ -1295,6 +1300,7 @@ def api_import_excel():
 
 
 def _pic_folder():
+    """Legacy flat picture folder, retained so existing URLs keep working."""
     base = os.path.dirname(os.path.abspath(DB_PATH)) if DB_PATH else os.getcwd()
     folder = os.path.join(base, "pic")
     os.makedirs(folder, exist_ok=True)
@@ -1305,6 +1311,40 @@ def _safe_filename(name):
     name = os.path.basename(name)
     name = re.sub(r"[^\w.\-]", "_", name)
     return name or "file"
+
+
+_SAFE_STORAGE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def _storage_id(value, field_name):
+    """Validate a path segment; never let client input choose a filesystem path."""
+    value = str(value or "").strip()
+    if not value or not _SAFE_STORAGE_ID.fullmatch(value):
+        raise ValueError(f"{field_name} must contain only letters, numbers, _ or -")
+    return value
+
+
+def _image_folder(project_number, op_number=None, item_id=None):
+    """Return the canonical local storage path for a project, op, or process item."""
+    base = os.path.dirname(os.path.abspath(DB_PATH)) if DB_PATH else os.getcwd()
+    parts = [base, "uploads", _storage_id(project_number, "project_number")]
+    if op_number:
+        parts.append(_storage_id(op_number, "op_number"))
+    if item_id:
+        parts.append(_storage_id(item_id, "item_id"))
+    folder = os.path.join(*parts)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _image_storage_key(project_number, op_number=None, item_id=None, filename=""):
+    parts = [str(project_number)]
+    if op_number:
+        parts.append(str(op_number))
+    if item_id:
+        parts.append(str(item_id))
+    return "/".join(parts + [filename])
 
 
 @app.route("/api/more_spec", methods=["POST"])
@@ -1357,15 +1397,56 @@ def api_upload_picture():
     f = request.files["file"]
     if not f.filename:
         return jsonify({"error": "empty filename"}), 400
-    safe  = f"{int(time.time() * 1000)}_{_safe_filename(f.filename)}"
-    dest  = os.path.join(_pic_folder(), safe)
+    # Project and operation establish the hierarchy. Item images are the normal
+    # process-screenshot case; omitting item_id creates an operation layout.
+    try:
+        project_number = _storage_id(request.form.get("project_number", "default"), "project_number")
+        op_number = request.form.get("op_number", "").strip()
+        item_id = request.form.get("item_id", "").strip()
+        if item_id and not op_number:
+            return jsonify({"error": "op_number is required when item_id is supplied"}), 400
+        if op_number:
+            op_number = _storage_id(op_number, "op_number")
+        if item_id:
+            item_id = _storage_id(item_id, "item_id")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    ext = os.path.splitext(_safe_filename(f.filename))[1].lower()
+    if ext not in _IMAGE_EXTENSIONS or not (f.mimetype or "").startswith("image/"):
+        return jsonify({"error": "only PNG, JPEG, GIF, and WebP images are allowed"}), 400
+
+    # A layout is intentionally a single replaceable asset per scope. Screenshots
+    # use a UUID, so uploads can be reordered or deleted without filename clashes.
+    is_layout = request.form.get("asset_type", "").strip().lower() == "layout"
+    safe = "layout_image" + ext if is_layout else f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(_image_folder(project_number, op_number or None, item_id or None), safe)
     f.save(dest)
-    return jsonify({"filename": safe, "url": f"/api/pic/{safe}"})
+    storage_key = _image_storage_key(project_number, op_number or None, item_id or None, safe)
+    return jsonify({
+        "filename": safe,
+        "storage_key": storage_key,
+        "url": f"/api/pic/{storage_key}",
+        "project_number": project_number,
+        "op_number": op_number,
+        "item_id": item_id,
+        "asset_type": "layout" if is_layout else "screenshot",
+    })
 
 
-@app.route("/api/pic/<filename>", methods=["GET"])
-def api_get_picture(filename):
-    return send_from_directory(_pic_folder(), filename)
+@app.route("/api/pic/<path:storage_key>", methods=["GET"])
+def api_get_picture(storage_key):
+    """Serve a legacy flat image or a validated hierarchical image key."""
+    segments = storage_key.split("/")
+    if len(segments) == 1:
+        return send_from_directory(_pic_folder(), segments[0])
+    if any(not _SAFE_STORAGE_ID.fullmatch(segment) for segment in segments[:-1]):
+        return jsonify({"error": "invalid image path"}), 400
+    filename = segments[-1]
+    if os.path.splitext(filename)[1].lower() not in _IMAGE_EXTENSIONS:
+        return jsonify({"error": "invalid image type"}), 400
+    base = os.path.dirname(os.path.abspath(DB_PATH)) if DB_PATH else os.getcwd()
+    return send_from_directory(os.path.join(base, "uploads", *segments[:-1]), filename)
 
 
 if __name__ == "__main__":
