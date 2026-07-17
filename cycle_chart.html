@@ -4300,6 +4300,17 @@ sap.ui.getCore().attachInit(function () {
       var key = oEvent.getParameter("selectedItem") && oEvent.getParameter("selectedItem").getKey();
       if (!key) return;
 
+      // Switching jobs replaces the visible tree and clears this job's
+      // in-memory caches. Confirm first and restore the dropdown on Cancel.
+      var previousJob = _jobState.job_number;
+      if (previousJob && key !== previousJob) {
+        if (!window.confirm('Switch from job "' + previousJob + '" to job "' + key + '"?')) {
+          oJobSelect.setSelectedKey(previousJob);
+          return;
+        }
+      }
+      if (key === previousJob) return;
+
       _jobState.job_number           = key;
       _jobState.job_title            = '';
       _jobState.job_description      = '';
@@ -6389,36 +6400,60 @@ sap.ui.getCore().attachInit(function () {
   }
 
   function _openMoreSpecDialog(item) {
-    var op      = oOpSelect.getSelectedKey();
-    var details = ((_itemsDetailsCache[op] || {})[item.item_id]) || {};
-    console.log('[vtMoreSpec] opening for item_id:', item.item_id, 'op:', op, '— details from cache:', JSON.parse(JSON.stringify(details)));
+    var op = oOpSelect.getSelectedKey();
+    var cachedDetails = ((_itemsDetailsCache[op] || {})[item.item_id]) || {};
 
-    var oIconTab = new sap.m.IconTabBar({
-      stretchContentHeight: true,
-      items: [
-        new sap.m.IconTabFilter({
-          text: 'Mechanical Design',
-          content: [_msBuildTabContent('mech', item.item_id, op, details)]
-        }),
-        new sap.m.IconTabFilter({
-          text: 'Control',
-          content: [_msBuildTabContent('ctrl', item.item_id, op, details)]
-        })
-      ]
-    });
+    function showDialog(details) {
+      var oIconTab = new sap.m.IconTabBar({
+        stretchContentHeight: true,
+        items: [
+          new sap.m.IconTabFilter({
+            text: 'Mechanical Design',
+            content: [_msBuildTabContent('mech', item.item_id, op, details)]
+          }),
+          new sap.m.IconTabFilter({
+            text: 'Control',
+            content: [_msBuildTabContent('ctrl', item.item_id, op, details)]
+          })
+        ]
+      });
 
-    var oDialog = new sap.m.Dialog({
-      title:         (item.step || '') + '  ' + (item.title || '') + '  — More Specifications',
-      contentWidth:  '620px',
-      contentHeight: '540px',
-      draggable:     true,
-      resizable:     true,
-      content:       [new sap.m.ScrollContainer({ vertical: true, horizontal: false, height: '100%', content: [oIconTab] })],
-      beginButton:   new sap.m.Button({ text: 'OK', type: 'Emphasized', press: function () { oDialog.close(); } }),
-      endButton:     new sap.m.Button({ text: 'Close', press: function () { oDialog.close(); } }),
-      afterClose:    function () { oDialog.destroy(); }
-    });
-    oDialog.open();
+      var oDialog = new sap.m.Dialog({
+        title:         (item.step || '') + '  ' + (item.title || '') + '  — More Specifications',
+        contentWidth:  '620px',
+        contentHeight: '540px',
+        draggable:     true,
+        resizable:     true,
+        content:       [new sap.m.ScrollContainer({ vertical: true, horizontal: false, height: '100%', content: [oIconTab] })],
+        beginButton:   new sap.m.Button({ text: 'OK', type: 'Emphasized', press: function () { oDialog.close(); } }),
+        endButton:     new sap.m.Button({ text: 'Close', press: function () { oDialog.close(); } }),
+        afterClose:    function () { oDialog.destroy(); }
+      });
+      oDialog.open();
+    }
+
+    // Read the latest saved details for this op when the dialog opens.
+    // The returned row contains both the designer and control fields.
+    if (!op || !item.item_id) {
+      showDialog(cachedDetails);
+      return;
+    }
+    fetch(API_BASE + '/api/items_details/' + encodeURIComponent(op))
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (rows) {
+        var cache = _itemsDetailsCache[op] || (_itemsDetailsCache[op] = {});
+        (rows || []).forEach(function (row) {
+          if (row.item_id) cache[row.item_id] = row;
+        });
+        showDialog(cache[item.item_id] || cachedDetails);
+      })
+      .catch(function (err) {
+        console.warn('[vtMoreSpec] could not load items_details:', err.message);
+        showDialog(cachedDetails);
+      });
   }
 
   window.vtToggleSection = function (id) {
