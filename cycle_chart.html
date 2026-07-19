@@ -349,8 +349,8 @@ sap.ui.getCore().attachInit(function () {
     SUBPROCESS:      'Parent Process',
     EQUAL_TO:        'Equal to',
     SEQUENTIAL:      'Sequential',
-    SYNC_START:      'Sync Start',
-    SYNC_COMPLETION: 'Sync Completion',
+    SYNC_START:      'Parallel',
+    SYNC_COMPLETION: 'Parallel',
     CYCLE_CALC:      'Cycle Time Cal',
     PREDEFINED:      'Predefined'
   };
@@ -2654,7 +2654,7 @@ sap.ui.getCore().attachInit(function () {
     var rawLinks  = details.designer_resources_links || '';
     var rawPictures = details.designer_picture_links || '';
     var flatMap   = buildFlatMap(oDataModel.getProperty('/items') || [], {});
-    var runCondition = _buildRcTooltipHtml(item.run_cond_config, flatMap)
+    var runCondition = _buildRcTooltipHtml(item.run_cond_config, flatMap, true)
       || '<span class="vtDi-ans">No run condition configured</span>';
     var station = item;
     while (station.parent_id && flatMap[station.parent_id]) station = flatMap[station.parent_id];
@@ -2905,7 +2905,7 @@ sap.ui.getCore().attachInit(function () {
     tip.style.left = x + 'px'; tip.style.top = y + 'px';
   }
 
-  function _buildRcTooltipHtml(rcStr, flatMap) {
+  function _buildRcTooltipHtml(rcStr, flatMap, includePredefinedFormula) {
     if (!rcStr || rcStr === '{}') return '';
     var json; try { json = JSON.parse(rcStr); } catch (e) { return ''; }
     var rows = [];
@@ -2924,6 +2924,17 @@ sap.ui.getCore().attachInit(function () {
                    : '&nbsp;&nbsp;&nbsp;' + v;
       });
       var htmlV = vParts.length ? '<br><em>' + vParts.join('<br>') + '</em>' : '';
+      if (includePredefinedFormula && condition === RC_COND.PREDEFINED) {
+        var predefinedName = values[0] || '';
+        var predefined = (_jobState.predefined_processes || []).filter(function (process) {
+          return process.name === predefinedName;
+        })[0];
+        var formula = predefined ? _cycleDetailsHtmlToPlainText(predefined.details || '') : '';
+        if (formula) {
+          htmlV += '<br><strong>Detailed formula:</strong> <em>'
+            + _cycleDetailsEscapeHtml(formula) + '</em>';
+        }
+      }
       rows.push((phase === 'Start' || phase === 'End')
         ? '<strong>' + phase + 's ' + condition + extra + '</strong>' + htmlV + '<br><br>'
         : '<strong>Cycle time: (' + condition + extra + ')</strong>' + htmlV + '<br><br>');
@@ -4881,7 +4892,7 @@ sap.ui.getCore().attachInit(function () {
       new sap.ui.core.Item({ key: RC_COND.AFTER,        text: 'After...  [Alt+S+A]' }),
       new sap.ui.core.Item({ key: RC_COND.WITH,         text: 'With ...  [Alt+S+W]' }),
       new sap.ui.core.Item({ key: RC_COND.SEQUENTIAL,   text: 'Sequential' }),
-      new sap.ui.core.Item({ key: RC_COND.SYNC_START,   text: 'Sync Start' })
+      new sap.ui.core.Item({ key: RC_COND.SYNC_START,   text: 'Parallel' })
     ],
     change: function (oEvent) { onStartConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
   });
@@ -5403,11 +5414,10 @@ sap.ui.getCore().attachInit(function () {
     width: '100%',
     items: [
       new sap.ui.core.Item({ key: '',                       text: '—' }),
-      new sap.ui.core.Item({ key: RC_COND.LAST,            text: 'Last process' }),
       new sap.ui.core.Item({ key: RC_COND.CUSTOM_VALUE,    text: 'Custom value' }),
       new sap.ui.core.Item({ key: RC_COND.BEFORE,          text: 'Before ...  [Alt+E+B]' }),
       new sap.ui.core.Item({ key: RC_COND.WITH,            text: 'With ...  [Alt+E+W]' }),
-      new sap.ui.core.Item({ key: RC_COND.SYNC_COMPLETION, text: 'Sync Completion' }),
+      new sap.ui.core.Item({ key: RC_COND.SYNC_COMPLETION, text: 'Parallel' }),
       new sap.ui.core.Item({ key: RC_COND.SEQUENTIAL,      text: 'Sequential' })
     ],
     change: function (oEvent) { onEndConditionChanged(oEvent.getParameter('selectedItem').getKey()); }
@@ -5469,12 +5479,12 @@ sap.ui.getCore().attachInit(function () {
       alignItems: 'Center',
       items: [
         new sap.m.HBox({ items: [
-          new sap.m.Button({ icon: "sap-icon://navigation-up-arrow",   type: "Accept", tooltip: "Add process above selected row",            press: function () { addProcessAt(0); } }),
-          new sap.m.Button({ icon: "sap-icon://navigation-down-arrow", type: "Accept", tooltip: "Add process below selected row",            press: function () { addProcessAt(1); } })
+          new sap.m.Button({ text: "Add Above", icon: "sap-icon://navigation-up-arrow",   type: "Accept", tooltip: "Add process above selected row", press: function () { addProcessAt(0); } }),
+          new sap.m.Button({ text: "Add Below", icon: "sap-icon://navigation-down-arrow", type: "Accept", tooltip: "Add process below selected row", press: function () { addProcessAt(1); } })
         ]}),
         new sap.m.HBox({ items: [
-          new sap.m.Button({ icon: "sap-icon://org-chart", type: "Accept", tooltip: "Add subprocess under selected row (Shift+P)", press: function () { addNewProcess(); } }),
-          new sap.m.Button({ icon: "sap-icon://delete",    type: "Reject", tooltip: "Delete selected process(es)",                 press: function () { removeProcess(); } })
+          new sap.m.Button({ text: "New Process", icon: "sap-icon://org-chart", type: "Accept", tooltip: "Add subprocess under selected row (Shift+P)", press: function () { addNewProcess(); } }),
+          new sap.m.Button({ text: "Delete Process", icon: "sap-icon://delete", type: "Reject", tooltip: "Delete selected process(es)", press: function () { removeProcess(); } })
         ]})
       ]
     }) ]
@@ -5500,7 +5510,7 @@ sap.ui.getCore().attachInit(function () {
     ]
   });
 
-  // ── Copy/Paste/Confirm panel — lives at the right of the RC toolbar ────────
+  // ── Copy/Paste panel ─────────────────────────────────────────────────
   var oCopyPastePanel = new sap.m.Panel({
     expandable: false, backgroundDesign: 'Transparent',
     content: [ new sap.m.HBox({
@@ -5510,16 +5520,6 @@ sap.ui.getCore().attachInit(function () {
           new sap.m.Button({ icon: "sap-icon://copy",     type: "Default", tooltip: "Copy selected item(s) (Ctrl+C)",  press: function () { copyToClipboard(); } }),
           new sap.m.Button({ icon: "sap-icon://scissors", type: "Default", tooltip: "Cut selected item(s) (Ctrl+X)",   press: function () { cutToClipboard(); } }),
           new sap.m.Label({ text: 'Clipboard' }).addStyleClass('vtCommandCaption')
-        ]}).addStyleClass('vtCPSection'),
-        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
-          new sap.m.Button({ icon: 'sap-icon://outdent', type: 'Default', tooltip: 'Level up — move selected processes to the parent level', press: function () { levelUpSelected(); } }),
-          new sap.m.Button({ icon: 'sap-icon://indent',  type: 'Default', tooltip: 'Level down — move selected processes under the preceding process', press: function () { levelDownSelected(); } }),
-          new sap.m.Label({ text: 'Hierarchy' }).addStyleClass('vtCommandCaption')
-        ]}).addStyleClass('vtCPSection'),
-        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
-          new sap.m.Button({ text: 'Move up',   icon: 'sap-icon://navigation-up-arrow',   type: 'Default', tooltip: 'Move selected process up (cut and paste above)',   press: function () { moveSelectedInOrder('up'); } }),
-          new sap.m.Button({ text: 'Move down', icon: 'sap-icon://navigation-down-arrow', type: 'Default', tooltip: 'Move selected process down (cut and paste below)', press: function () { moveSelectedInOrder('down'); } }),
-          new sap.m.Label({ text: 'Order' }).addStyleClass('vtCommandCaption')
         ]}).addStyleClass('vtCPSection'),
         new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
           new sap.m.Button({ icon: "sap-icon://org-chart",             type: "Default", tooltip: "Paste as subprocess of selected row (Ctrl+V)", press: function () { pasteFromClipboard('subprocess'); } }),
@@ -5538,8 +5538,36 @@ sap.ui.getCore().attachInit(function () {
   var oCopyPasteBox = new sap.m.VBox({
     alignItems: 'Center',
     items: [
-      new sap.m.Label({ text: 'Copy & Arrange' }).addStyleClass('vtToolGroupTitle'),
+      new sap.m.Label({ text: 'Copy/Paste' }).addStyleClass('vtToolGroupTitle'),
       oCopyPastePanel
+    ]
+  }).addStyleClass('vtRcAddRemoveBox');
+
+  // ── Rearrange panel ─────────────────────────────────────────────────────
+  var oRearrangePanel = new sap.m.Panel({
+    expandable: false, backgroundDesign: 'Transparent',
+    content: [ new sap.m.HBox({
+      alignItems: 'Stretch',
+      items: [
+        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
+          new sap.m.Button({ icon: 'sap-icon://outdent', type: 'Default', tooltip: 'Level up — move selected processes to the parent level', press: function () { levelUpSelected(); } }),
+          new sap.m.Button({ icon: 'sap-icon://indent',  type: 'Default', tooltip: 'Level down — move selected processes under the preceding process', press: function () { levelDownSelected(); } }),
+          new sap.m.Label({ text: 'Hierarchy' }).addStyleClass('vtCommandCaption')
+        ]}).addStyleClass('vtCPSection'),
+        new sap.m.VBox({ justifyContent: 'Center', alignItems: 'Center', items: [
+          new sap.m.Button({ text: 'Move up',   icon: 'sap-icon://navigation-up-arrow',   type: 'Default', tooltip: 'Move selected process up (cut and paste above)',   press: function () { moveSelectedInOrder('up'); } }),
+          new sap.m.Button({ text: 'Move down', icon: 'sap-icon://navigation-down-arrow', type: 'Default', tooltip: 'Move selected process down (cut and paste below)', press: function () { moveSelectedInOrder('down'); } }),
+          new sap.m.Label({ text: 'Order' }).addStyleClass('vtCommandCaption')
+        ]}).addStyleClass('vtCPSection')
+      ]
+    }) ]
+  }).addStyleClass('vtRcPanel vtRcAddRemovePanel vtCopyPastePanel sapUiSizeCompact');
+
+  var oRearrangeBox = new sap.m.VBox({
+    alignItems: 'Center',
+    items: [
+      new sap.m.Label({ text: 'Rearrange' }).addStyleClass('vtToolGroupTitle'),
+      oRearrangePanel
     ]
   }).addStyleClass('vtRcAddRemoveBox');
 
@@ -5649,7 +5677,7 @@ sap.ui.getCore().attachInit(function () {
     width: '100%',
     items: [
       new sap.m.FlexBox({ wrap: 'Wrap', alignItems: 'Start', alignContent: 'Start', width: '100%',
-        items: [ oAddRemoveBox, oRcPhasesBox, oCopyPasteBox, oExtraToolsBox, oCycleTypeBox ]
+        items: [ oAddRemoveBox, oRcPhasesBox, oCopyPasteBox, oRearrangeBox, oExtraToolsBox, oCycleTypeBox ]
       }).addStyleClass('vtRcToolbarRow')
     ]
   }).addStyleClass('vtRcToolbar sapUiSizeCompact');
@@ -5921,7 +5949,7 @@ sap.ui.getCore().attachInit(function () {
       'Robot cycle':   '#EBDD6C',
       'Machine cycle': '#05DF72',
       'Manual cycle':  '#EB1E29',
-      'Operator wait': '#1EC2EB'
+      'Operator wait': '#EB1E29'
     };
     var machineResources  = _jobState.machine_list  || [];
     var robotResources    = _jobState.robot_list    || [];
@@ -5931,7 +5959,7 @@ sap.ui.getCore().attachInit(function () {
       var resourceName = String(category || '').split('-').pop();
       if (machineResources.indexOf(resourceName) >= 0)  return cycleTypeColors['Machine cycle'];
       if (robotResources.indexOf(resourceName) >= 0)    return cycleTypeColors['Robot cycle'];
-      if (operatorResources.indexOf(resourceName) >= 0) return cycleTypeColors['Operator wait'];
+      if (operatorResources.indexOf(resourceName) >= 0) return cycleTypeColors['Manual cycle'];
       return '#09528A';
     });
     var datasets = [{
@@ -7222,9 +7250,104 @@ sap.ui.getCore().attachInit(function () {
         targetCycleTime: Number(_jobState.target_cycle_time) || 0,
         generatedAt: new Date().toLocaleString(),
         logo: logo,
+        predefinedProcesses: JSON.parse(JSON.stringify(_jobState.predefined_processes || [])),
         ops: reportOps
       };
     });
+  }
+
+  // Serialized into the offline report by _vtUpgradeStandaloneReportDialog.
+  // Its dependencies (REPORT, $, esc, n, flat, resources and
+  // organizedRunCondition) are all defined inside that report's IIFE.
+  function _vtStandaloneReportPopupDetail(op, item) {
+    var details = op.details[item.item_id] || {};
+    var map = Object.fromEntries(flat(op.items).map(function (entry) { return [entry.item_id, entry]; }));
+    var station = item;
+    while (station.parent_id && map[station.parent_id]) station = map[station.parent_id];
+
+    var parents = [], parent = item.parent_id ? map[item.parent_id] : null;
+    while (parent && parent !== station) {
+      parents.unshift('<i>' + esc((parent.step ? parent.step + '> ' : '') + (parent.title || '')) + '</i>');
+      parent = parent.parent_id ? map[parent.parent_id] : null;
+    }
+    var children = (item.sub_process_items || []).map(function (child) {
+      return '<i>' + esc((child.step ? child.step + '> ' : '') + (child.title || '')) + '</i>';
+    });
+    var usage = resources([item]);
+    var resourceHtml = Object.keys(usage).sort().map(function (name) {
+      return '<i>' + esc(name) + '</i> &mdash; ' + n(usage[name]) + ' s';
+    }).join('<br>');
+
+    var dependants = [];
+    try {
+      var dependencyConfig = JSON.parse(item.dependant_items || '{}');
+      Object.keys(dependencyConfig).forEach(function (phase) {
+        (Array.isArray(dependencyConfig[phase]) ? dependencyConfig[phase] : []).forEach(function (id) {
+          var ref = map[id];
+          var label = ref ? (ref.step ? ref.step + '> ' : '') + (ref.title || id) : id;
+          dependants.push('<strong>' + esc(phase.charAt(0).toUpperCase() + phase.slice(1))
+            + ':</strong> <i>' + esc(label) + '</i>');
+        });
+      });
+    } catch (ignore) {}
+
+    var runCondition = organizedRunCondition(op, item) || '<span class="di-ans">No run condition configured</span>';
+    try {
+      var rc = JSON.parse(item.run_cond_config || '{}');
+      Object.keys(rc).forEach(function (phase) {
+        var phaseConfig = rc[phase] || {};
+        if (!Object.prototype.hasOwnProperty.call(phaseConfig, 'Predefined')) return;
+        var name = (phaseConfig.Predefined || [])[0] || '';
+        var predefined = (REPORT.predefinedProcesses || []).find(function (process) { return process.name === name; });
+        var formula = predefined ? String(predefined.details || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+        if (formula) runCondition += '<strong>Detailed formula:</strong> <i>' + esc(formula) + '</i><br>';
+      });
+    } catch (ignore) {}
+
+    var links = String(details.designer_resources_links || '').split(/\r?\n/).filter(Boolean);
+    var images = details.embedded_images || [];
+    var linksHtml = links.length ? links.map(function (link) {
+      return '<a class="di-link" href="' + esc(link) + '" target="_blank" rel="noopener">&#128279; <span>' + esc(link) + '</span></a>';
+    }).join('') : '<div class="di-empty">No reference links have been added.</div>';
+    var picturesHtml = images.length ? '<div class="di-pics">' + images.map(function (src, index) {
+      return '<a href="' + src + '" target="_blank"><img src="' + src + '" alt="Mechanical design picture ' + (index + 1) + '"><span>Picture ' + (index + 1) + ' &middot; Open full size</span></a>';
+    }).join('') + '</div>' : '<div class="di-empty di-empty-pics">No mechanical-design pictures have been added.</div>';
+
+    var empty = function (text) { return '<span class="di-ans">' + text + '</span>'; };
+    $('#modalContent').innerHTML = '<style>'
+      + '.modal-card{max-width:680px;padding:0;overflow:hidden}.close{z-index:2;color:#fff}.di{padding:20px;background:#f4f7f9;color:#263746;line-height:1.45}.di-hero{background:linear-gradient(135deg,#0a6ed1,#0854a0);color:#fff;border-radius:8px;padding:16px 18px}.di-kicker{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;opacity:.8}.di-title{font-size:20px;font-weight:700;margin:3px 0 0}.di-section{margin-top:16px}.di-section-title{display:flex;align-items:center;gap:8px;color:#183b56;font-weight:700;margin-bottom:7px}.di-section-title:after{content:"";height:1px;background:#ccd8e2;flex:1}.di table{border-collapse:separate;border-spacing:0;background:#fff;border:1px solid #d5e0e8;border-radius:7px;overflow:hidden}.di td{border:0;border-bottom:1px solid #e7edf2;padding:9px 12px}.di tr:last-child td{border-bottom:0}.di td:first-child{width:145px;background:#f7f9fb;color:#526575;font-size:11px;font-weight:700;text-transform:uppercase}.di-card{background:#fff;border:1px solid #d5e0e8;border-radius:8px;padding:13px 14px;margin-top:10px}.di-card-title{color:#0a6ed1;font-size:12px;font-weight:700;text-transform:uppercase;margin-bottom:8px}.di-empty,.di-ans{color:#718393;font-style:italic}.di-link{display:flex;gap:8px;padding:7px;color:#0a6ed1;text-decoration:none}.di-pics{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}.di-pics a{color:#38566e;text-decoration:none;border:1px solid #cfdae3;border-radius:7px;overflow:hidden;background:#f7f9fb}.di-pics img{display:block;width:100%;height:105px;object-fit:cover}.di-pics span{display:block;padding:7px 9px;font-size:12px;font-weight:600}.di-empty-pics{padding:18px;text-align:center;border:1px dashed #b8c8d4;border-radius:6px}'
+      + '</style><div class="di"><div class="di-hero"><div class="di-kicker">Process details</div><p class="di-title">'
+      + esc(item.step || '') + ' &mdash; ' + esc(item.title || '') + '</p></div>'
+      + '<div class="di-section"><div class="di-section-title">Structure</div><table>'
+      + '<tr><td>Station</td><td><i>' + esc((station.step ? station.step + '> ' : '') + (station.title || '')) + '</i></td></tr>'
+      + '<tr><td>Parent Processes</td><td>' + (parents.join('<br>') || empty('No parent processes')) + '</td></tr>'
+      + '<tr><td>Subprocesses</td><td>' + (children.join('<br>') || empty('No subprocesses')) + '</td></tr></table></div>'
+      + '<div class="di-section"><div class="di-section-title">Execution &amp; Timing</div><table>'
+      + '<tr><td>Cycle Type</td><td><i>' + esc(item.cycle_type || '') + '</i></td></tr>'
+      + '<tr><td>Resource Usage</td><td>' + (resourceHtml || empty('No resource usage available')) + '</td></tr>'
+      + '<tr><td>Run Condition</td><td>' + runCondition + '</td></tr>'
+      + '<tr><td>Dependent Items</td><td>' + (dependants.join('<br>') || empty('No dependent items')) + '</td></tr>'
+      + '<tr><td>Start Time (s)</td><td><i>' + n(item.cycle_start) + '</i></td></tr>'
+      + '<tr><td>End Time (s)</td><td><i>' + n(item.cycle_end) + '</i></td></tr>'
+      + '<tr><td>Cycle Time (s)</td><td><i>' + n(item.cycle_time) + '</i></td></tr></table></div>'
+      + '<div class="di-section"><div class="di-section-title">Mechanical Design</div>'
+      + '<div class="di-card"><div class="di-card-title">Comments</div>'
+      + (details.designer_comments ? '<div>' + esc(details.designer_comments) + '</div>' : '<div class="di-empty">No mechanical-design comments have been added.</div>') + '</div>'
+      + '<div class="di-card"><div class="di-card-title">Reference Links</div>' + linksHtml + '</div>'
+      + '<div class="di-card"><div class="di-card-title">Pictures</div>' + picturesHtml + '</div></div></div>';
+    $('#modal').classList.add('open');
+    $('.close').onclick = function () { $('#modal').classList.remove('open'); };
+    $('#modal').onclick = function (event) { if (event.target.id === 'modal') $('#modal').classList.remove('open'); };
+  }
+
+  function _vtUpgradeStandaloneReportDialog(html) {
+    var start = html.indexOf('function popupDetail(op,item){');
+    var end = html.indexOf('};$("#project")', start);
+    if (start < 0 || end < 0) return html;
+    var popupSource = _vtStandaloneReportPopupDetail.toString()
+      .replace('function _vtStandaloneReportPopupDetail', 'function popupDetail');
+    html = html.slice(0, start) + popupSource + html.slice(end + 2);
+    return html;
   }
 
   function _vtBuildStandaloneHtmlReport(payload) {
@@ -7458,7 +7581,7 @@ sap.ui.getCore().attachInit(function () {
     missing.forEach(function (op) { load = load.then(function () { return _fetchTreeToCache(op); }); });
     load.then(function () { return _vtCreateHtmlReportPayload(ops); })
       .then(function (payload) {
-        var blob = new Blob([_vtBuildStandaloneHtmlReport(payload)], { type: 'text/html;charset=utf-8' });
+        var blob = new Blob([_vtUpgradeStandaloneReportDialog(_vtBuildStandaloneHtmlReport(payload))], { type: 'text/html;charset=utf-8' });
         var safe = (payload.projectNumber + '_' + payload.projectTitle).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'cycle_chart_report';
         var reportDate = new Date().toISOString().slice(0, 10);
         var link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = safe + '_Cycle_Charts_' + reportDate + '.html';
@@ -8008,14 +8131,20 @@ sap.ui.getCore().attachInit(function () {
       var ids = oRcState.activeItemIds.slice();
       if (!ids.length) { sap.m.MessageToast.show('Select an item first.'); return; }
 
-      // ColorPalette supplies SAPUI5's standard theme-aware swatches. Load it
-      // explicitly because it is not part of the initial sap.m control set.
+      // Load ColorPalette explicitly because it is not part of the initial
+      // sap.m control set. Use light swatches so title highlights remain subtle
+      // and the text stays easy to read in the Design tab.
       sap.ui.require(['sap/m/ColorPalette'], function (ColorPalette) {
         var items = oDataModel.getProperty('/items');
         var flatMap = buildFlatMap(items, {});
         var firstItem = flatMap[ids[0]];
-        var selectedColor = (firstItem && firstItem.highlight) || '#ffcc00';
+        var selectedColor = (firstItem && firstItem.highlight) || '#FFF3B0';
         var oPalette = new ColorPalette({
+          colors: [
+            '#FDE2E2', '#FAD2E1', '#E2D1F9', '#DAD7FE',
+            '#DCEBFF', '#CDEDF6', '#CDEFE8', '#DDF3D5',
+            '#EEF4C7', '#FFF3B0', '#FFE5B4', '#F6E1C3'
+          ],
           colorSelect: function (oEvent) {
             selectedColor = oEvent.getParameter('value') || selectedColor;
           }
