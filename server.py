@@ -169,8 +169,8 @@ def _make_excel_report(proj_num, proj_title, target_ct, ops_data):
 # ── Real DB configuration (optional) ──────────────────────────────────────────
 # Set DB_PATH to your .db or .sqlite file to use a real database.
 # Leave as None to use the embedded sample data below.
-DB_PATH    = None   # e.g. r"C:\path\to\your\chart.db"
-TABLE_NAME = "cycle_general_structure"   # actual table name from the PyQt6 app
+DB_PATH    = os.environ.get("DB_PATH") or None  # e.g. r"C:\path\to\your\chart.db"
+TABLE_NAME = os.environ.get("TABLE_NAME", "cycle_general_structure")
 
 # ── Sample data ───────────────────────────────────────────────────────────────
 SAMPLE_DATA = [
@@ -462,6 +462,7 @@ def api_update_db():
     import json as _json
     print("[updateDB] full payload:\n" + _json.dumps(data, indent=2))
     updated_db = data.get("cycle_general_structure", data.get("updated_db", []))
+    items_details = data.get("items_details", [])
     op_number  = data.get("op_number", "")
     item_ids_to_delete = [str(item_id) for item_id in data.get("item_ids_to_delete", []) if item_id]
     ops_to_delete = [str(op) for op in data.get("ops_to_delete", []) if op]
@@ -553,6 +554,14 @@ def api_update_db():
             OP_NUMBERS.discard(deleted_op)
             OP_METADATA.pop(deleted_op, None)
         for deleted_project in projects_to_delete:
+            # items_details does not store project_number. Remove linked detail
+            # rows before deleting their source rows from the main table.
+            cur.execute(
+                f"DELETE FROM items_details "
+                f"WHERE item_id IN (SELECT item_id FROM {TABLE_NAME} WHERE project_number = ?) "
+                f"OR op_number IN (SELECT DISTINCT op_number FROM {TABLE_NAME} WHERE project_number = ?)",
+                (deleted_project, deleted_project),
+            )
             cur.execute(f"DELETE FROM {TABLE_NAME} WHERE project_number = ?", (deleted_project,))
             cur.execute("DELETE FROM project_metadata WHERE project_no = ?", (deleted_project,))
 
@@ -586,6 +595,39 @@ def api_update_db():
                 print(f"[updateDB] cols={cols}")
                 print(f"[updateDB] values={values}")
                 raise
+
+        # More Specifications are saved with the process tree. Persist their
+        # picture URLs so the dialog can rebuild its thumbnails after reload.
+        detail_columns = {
+            "op_number", "designer_comments", "designer_resources_links",
+            "designer_picture_links", "machine_cycle_time_summary",
+            "total_machine_cycle", "total_manual_cycle", "total_robot_cycle",
+            "total_operator_cycle", "used_cycle_time", "num_of_parts",
+        }
+        for detail in items_details:
+            item_id = str(detail.get("item_id") or "")
+            if not item_id:
+                continue
+            fields = {key: detail.get(key) for key in detail_columns if key in detail}
+            if op_number and "op_number" not in fields:
+                fields["op_number"] = op_number
+            if not fields:
+                continue
+            columns = list(fields)
+            values = [fields[column] for column in columns]
+            set_clause = ", ".join(f"{column}=?" for column in columns)
+            cur.execute(
+                f"UPDATE items_details SET {set_clause} WHERE item_id=?",
+                values + [item_id],
+            )
+            if cur.rowcount == 0:
+                insert_columns = ["item_id"] + columns
+                placeholders = ",".join("?" for _ in insert_columns)
+                cur.execute(
+                    f"INSERT INTO items_details ({','.join(insert_columns)}) "
+                    f"VALUES ({placeholders})",
+                    [item_id] + values,
+                )
         conn.commit()
         conn.close()
     else:
@@ -601,6 +643,22 @@ def api_update_db():
             SAMPLE_DATA = [r for r in SAMPLE_DATA if str(r.get("op_number")) != deleted_op]
             OP_NUMBERS.discard(deleted_op)
             OP_METADATA.pop(deleted_op, None)
+        if op_number:
+            details_by_id = {
+                str(row.get("item_id")): row
+                for row in ITEMS_DETAILS.setdefault(op_number, [])
+                if row.get("item_id")
+            }
+            for detail in items_details:
+                item_id = str(detail.get("item_id") or "")
+                if not item_id:
+                    continue
+                if item_id in details_by_id:
+                    details_by_id[item_id].update(detail)
+                else:
+                    row = dict(detail, item_id=item_id, op_number=op_number)
+                    ITEMS_DETAILS[op_number].append(row)
+                    details_by_id[item_id] = row
 
     return jsonify({
         "request_title": "updated_db",
@@ -756,7 +814,16 @@ def api_update_tree():
         conn.row_factory = sqlite3.Row
         _ensure_items_details_table(conn)
         cur = conn.cursor()
-        cur.execute("SELECT * FROM items_details WHERE op_number = ?", (op,))
+        item_ids = [str(r.get("item_id")) for r in records if r.get("item_id")]
+        if item_ids:
+            placeholders = ",".join("?" for _ in item_ids)
+            cur.execute(
+                f"SELECT * FROM items_details "
+                f"WHERE op_number = ? OR item_id IN ({placeholders})",
+                [op, *item_ids],
+            )
+        else:
+            cur.execute("SELECT * FROM items_details WHERE op_number = ?", (op,))
         items_details = [dict(r) for r in cur.fetchall()]
         conn.commit()
         conn.close()
