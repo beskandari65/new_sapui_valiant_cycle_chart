@@ -58,6 +58,8 @@
     .vtRcToolbar .sapMTBSpacer { background-color: #f7f9fb !important; }
     .vtRcToolbar { padding: 6px 8px 5px; border-bottom: 1px solid #d9dfe7; }
     .vtRcToolbarRow { align-content: flex-start !important; gap: 6px; }
+    .vtMiniPieRibbonSpacer { flex: 1 1 auto !important; min-width: 12px; }
+    .vtMiniPieRibbonStandalone { align-self: center !important; }
     .vtRcPanel { margin: 0; width: 200px; background: #fff !important; border: 1px solid #d7dde5 !important; border-radius: 6px; box-shadow: 0 1px 2px rgba(34,53,72,0.08); overflow: hidden; }
     /* Strip all internal spacing from the phase boxes */
     .vtRcPanel .sapMPanelWrappingDivTb { padding: 0 !important; }
@@ -948,6 +950,40 @@ sap.ui.getCore().attachInit(function () {
     return out;
   }
 
+  // Keep a cached multi-selection in hierarchical step order (S1, P1_1,
+  // P1_2, S2, ...). RC changes are applied in this order so a dependent item
+  // is never processed before an earlier selected step it relies on.
+  function _sortSelectedIdsByStep(ids) {
+    var flat = flattenInOrder(oDataModel.getProperty('/items'));
+    var byId = {};
+    var treeOrder = {};
+    flat.forEach(function (item, index) {
+      byId[item.item_id] = item;
+      treeOrder[item.item_id] = index;
+    });
+
+    function stepParts(item) {
+      return String((item && item.step) || '').match(/\d+/g) || [];
+    }
+    function compareIds(a, b) {
+      var ap = stepParts(byId[a]).map(Number);
+      var bp = stepParts(byId[b]).map(Number);
+      if (ap.length && bp.length) {
+        for (var i = 0; i < Math.max(ap.length, bp.length); i++) {
+          if (i >= ap.length) return -1;
+          if (i >= bp.length) return 1;
+          if (ap[i] !== bp[i]) return ap[i] - bp[i];
+        }
+      }
+      return (treeOrder[a] === undefined ? Number.MAX_SAFE_INTEGER : treeOrder[a]) -
+             (treeOrder[b] === undefined ? Number.MAX_SAFE_INTEGER : treeOrder[b]);
+    }
+
+    return (ids || []).filter(function (id, index, all) {
+      return byId[id] && all.indexOf(id) === index;
+    }).sort(compareIds);
+  }
+
   // Stamps a CSS class on BOTH the fixed-column TR and the scroll-column TR so that
   // all columns (including the fixed "Cycle Description" column) are covered.
   // Uses the row's actual DOM position inside its own tbody instead of the logical
@@ -1017,6 +1053,7 @@ sap.ui.getCore().attachInit(function () {
     oRcStartCheck.setSelected(true);  setPhaseControlsEnabled('start', true);
     oRcCycleCheck.setSelected(true);  setPhaseControlsEnabled('cycle', true);
     oRcEndCheck.setSelected(false);   setPhaseControlsEnabled('end',   false);
+    _syncPhaseCheckboxAvailability();
   }
 
   function selectAllTreeItems() {
@@ -1088,6 +1125,7 @@ sap.ui.getCore().attachInit(function () {
         var lo = Math.min(anchorIdx, clickedIdx);
         var hi = Math.max(anchorIdx, clickedIdx);
         oRcState.activeItemIds = flat.slice(lo, hi + 1).map(function (it) { return it.item_id; });
+        oRcState.activeItemIds = _sortSelectedIdsByStep(oRcState.activeItemIds);
       }
       setReference(oObj);
     } else if (_ctrlKeyHeld) {
@@ -1095,6 +1133,7 @@ sap.ui.getCore().attachInit(function () {
       var idx = oRcState.activeItemIds.indexOf(oObj.item_id);
       if (idx >= 0) {
         oRcState.activeItemIds.splice(idx, 1);
+        oRcState.activeItemIds = _sortSelectedIdsByStep(oRcState.activeItemIds);
         if (oRcState.activeItemIds.length === 0) { clearRowHighlight(); return; }
         if (oSelectedItemId === oObj.item_id) {
           var fm0 = buildFlatMap(oDataModel.getProperty("/items"), {});
@@ -1103,6 +1142,7 @@ sap.ui.getCore().attachInit(function () {
         }
       } else {
         oRcState.activeItemIds.push(oObj.item_id);
+        oRcState.activeItemIds = _sortSelectedIdsByStep(oRcState.activeItemIds);
         setReference(oObj);
         _anchorItemId = oObj.item_id;
       }
@@ -1134,6 +1174,10 @@ sap.ui.getCore().attachInit(function () {
   // If active phases != 2, shows a warning dialog; user can still proceed.
   function applyRcChange(phase, condition, values, offset) {
     if (!oRcState.activeItemIds.length) { sap.m.MessageToast.show("Select a row first"); return; }
+
+    // Normalize again at the consumption boundary in case selection state was
+    // restored from history or populated by another command.
+    oRcState.activeItemIds = _sortSelectedIdsByStep(oRcState.activeItemIds);
 
     function doApply() {
       beginHistoryAction();
@@ -1247,6 +1291,7 @@ sap.ui.getCore().attachInit(function () {
     oRcStartCheck.setSelected(sA);
     oRcCycleCheck.setSelected(cA);
     oRcEndCheck.setSelected(eA);
+    _syncPhaseCheckboxAvailability();
     setPhaseControlsEnabled('start', sA);
     setPhaseControlsEnabled('cycle', cA);
     setPhaseControlsEnabled('end',   eA);
@@ -1407,6 +1452,17 @@ sap.ui.getCore().attachInit(function () {
     return phase === 'start' ? oRcStartCheck : phase === 'cycle' ? oRcCycleCheck : oRcEndCheck;
   }
 
+  // Keep active phases removable, but disable the remaining checkbox once the
+  // maximum of two phases has been reached.
+  function _syncPhaseCheckboxAvailability() {
+    ['start', 'cycle', 'end'].forEach(function (phase) {
+      var checkbox = getPhaseCheckbox(phase);
+      if (checkbox) {
+        checkbox.setEnabled(oActivePhases.includes(phase) || oActivePhases.length < 2);
+      }
+    });
+  }
+
   function setPhaseControlsEnabled(phase, enabled) {
     if (phase === 'start') {
       oRcStartSelect.setEnabled(enabled);
@@ -1432,7 +1488,14 @@ sap.ui.getCore().attachInit(function () {
   function onPhaseCheckChanged(phase, checked) {
     if (checked) {
       if (oActivePhases.includes(phase)) return;
+      if (oActivePhases.length >= 2) {
+        getPhaseCheckbox(phase).setSelected(false);
+        _syncPhaseCheckboxAvailability();
+        sap.m.MessageToast.show('Only 2 RC phases can be selected');
+        return;
+      }
       oActivePhases.push(phase);
+      _syncPhaseCheckboxAvailability();
       setPhaseControlsEnabled(phase, true);
       var item = getCurrentItem();
       if (item) {
@@ -1448,6 +1511,7 @@ sap.ui.getCore().attachInit(function () {
         return;
       }
       oActivePhases.splice(oActivePhases.indexOf(phase), 1);
+      _syncPhaseCheckboxAvailability();
       setPhaseControlsEnabled(phase, false);
       var item = getCurrentItem();
       if (item) {
@@ -5471,6 +5535,7 @@ sap.ui.getCore().attachInit(function () {
 
   // End phase is initially the derived phase — disable its controls at startup
   setPhaseControlsEnabled('end', false);
+  _syncPhaseCheckboxAvailability();
 
   // ── Add/Remove panel — lives at the left of the RC toolbar ───────────────
   var oAddRemovePanel = new sap.m.Panel({
@@ -5664,20 +5729,23 @@ sap.ui.getCore().attachInit(function () {
     preferDOM: true,
     content:
       '<div class="vtMiniPieWrap">' +
-        '<div style="position:relative;width:34px;height:34px;flex-shrink:0;">' +
+        '<div style="position:relative;width:52px;height:52px;flex-shrink:0;">' +
           '<canvas id="vtMiniPieCanvas"></canvas>' +
         '</div>' +
         '<div id="vtMiniPieInfo" class="vtMiniPieInfo">—</div>' +
       '</div>',
     afterRendering: function () { setTimeout(_updateMiniPie, 0); }
-  });
+  }).addStyleClass('vtMiniPieRibbonStandalone');
+
+  var oMiniPieRibbonSpacer = new sap.m.ToolbarSpacer()
+    .addStyleClass('vtMiniPieRibbonSpacer');
 
   // ── RC section: three GroupBox-style panels + status bar ─────────────────
   var oRcToolbar = new sap.m.VBox({
     width: '100%',
     items: [
       new sap.m.FlexBox({ wrap: 'Wrap', alignItems: 'Start', alignContent: 'Start', width: '100%',
-        items: [ oAddRemoveBox, oRcPhasesBox, oCopyPasteBox, oRearrangeBox, oExtraToolsBox, oCycleTypeBox ]
+        items: [ oAddRemoveBox, oRcPhasesBox, oCopyPasteBox, oRearrangeBox, oExtraToolsBox, oCycleTypeBox, oMiniPieRibbonSpacer, oMiniPieWidget ]
       }).addStyleClass('vtRcToolbarRow')
     ]
   }).addStyleClass('vtRcToolbar sapUiSizeCompact');
@@ -5703,9 +5771,7 @@ sap.ui.getCore().attachInit(function () {
         type:    "Transparent",
         tooltip: "Collapse All",
         press:   function () { oTable.collapseAll(); }
-      }),
-      new sap.m.ToolbarSpacer(),
-      oMiniPieWidget
+      })
     ]
   }).addStyleClass('sapUiSizeCompact vtDesignStatusBar');
 
@@ -8040,32 +8106,32 @@ sap.ui.getCore().attachInit(function () {
       clearTimeout(_rcShortcutTimer);
       if (_p === 'S' && (e.key === 'a' || e.key === 'A')) {
         e.preventDefault();
-        oRcStartCheck.setSelected(true);  onPhaseCheckChanged('start', true);
         oRcEndCheck.setSelected(false);   onPhaseCheckChanged('end',   false);
+        oRcStartCheck.setSelected(true);  onPhaseCheckChanged('start', true);
         oRcStartSelect.setSelectedKey(RC_COND.AFTER);
         onStartConditionChanged(RC_COND.AFTER);
         return;
       }
       if (_p === 'S' && (e.key === 'w' || e.key === 'W')) {
         e.preventDefault();
-        oRcStartCheck.setSelected(true);  onPhaseCheckChanged('start', true);
         oRcEndCheck.setSelected(false);   onPhaseCheckChanged('end',   false);
+        oRcStartCheck.setSelected(true);  onPhaseCheckChanged('start', true);
         oRcStartSelect.setSelectedKey(RC_COND.WITH);
         onStartConditionChanged(RC_COND.WITH);
         return;
       }
       if (_p === 'E' && (e.key === 'w' || e.key === 'W')) {
         e.preventDefault();
-        oRcEndCheck.setSelected(true);   onPhaseCheckChanged('end',   true);
         oRcStartCheck.setSelected(false); onPhaseCheckChanged('start', false);
+        oRcEndCheck.setSelected(true);    onPhaseCheckChanged('end',   true);
         oRcEndSelect.setSelectedKey(RC_COND.WITH);
         onEndConditionChanged(RC_COND.WITH);
         return;
       }
       if (_p === 'E' && (e.key === 'b' || e.key === 'B')) {
         e.preventDefault();
-        oRcEndCheck.setSelected(true);   onPhaseCheckChanged('end',   true);
         oRcStartCheck.setSelected(false); onPhaseCheckChanged('start', false);
+        oRcEndCheck.setSelected(true);    onPhaseCheckChanged('end',   true);
         oRcEndSelect.setSelectedKey(RC_COND.BEFORE);
         onEndConditionChanged(RC_COND.BEFORE);
         return;
