@@ -7635,7 +7635,8 @@ sap.ui.getCore().attachInit(function () {
   function _vtExcelChartXml(spec, chartId) {
     var lastRow = spec.rowCount + 4;
     var quotedSheet = "'" + spec.sheetName.replace(/'/g, "''") + "'";
-    var range = function (column) { return quotedSheet + '!$' + column + '$5:$' + column + '$' + lastRow; };
+    var escapeXml = function (value) { return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
+    var range = function (column) { return escapeXml(quotedSheet + '!$' + column + '$5:$' + column + '$' + lastRow); };
     var series = function (index, name, valuesColumn, color, hidden) {
       var fill = hidden ? '<a:noFill/>' : '<a:solidFill><a:srgbClr val="' + color + '"/></a:solidFill>';
       return '<c:ser><c:idx val="' + index + '"/><c:order val="' + index + '"/><c:tx><c:v>' + name.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</c:v></c:tx><c:spPr>' + fill + '<a:ln><a:noFill/></a:ln></c:spPr><c:cat><c:strRef><c:f>' + range('A') + '</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>' + range(valuesColumn) + '</c:f></c:numRef></c:val></c:ser>';
@@ -7648,8 +7649,8 @@ sap.ui.getCore().attachInit(function () {
   function _vtExcelValidChartXml(spec) {
     var lastRow = spec.rowCount + 4;
     var sheet = "'" + spec.sheetName.replace(/'/g, "''") + "'";
-    var formula = function (column) { return sheet + '!$' + column + '$5:$' + column + '$' + lastRow; };
     var escapeXml = function (value) { return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
+    var formula = function (column) { return escapeXml(sheet + '!$' + column + '$5:$' + column + '$' + lastRow); };
     var series = function (index, title, column, color, isOffset) {
       var shape = isOffset
         ? '<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>'
@@ -7675,7 +7676,10 @@ sap.ui.getCore().attachInit(function () {
       var chartPath = 'xl/charts/chart' + id + '.xml';
       var chartHeight = 200 + spec.rowCount * 45;
       zip.file(chartPath, _vtExcelValidChartXml(spec));
-      zip.file(drawingPath, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><wsDr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><oneCellAnchor><from><col>0</col><colOff>0</colOff><row>3</row><rowOff>0</rowOff></from><ext cx="9715500" cy="' + (chartHeight * 9525) + '"/><graphicFrame><nvGraphicFramePr><cNvPr id="' + id + '" name="Cycle Chart"/><cNvGraphicFramePr/></nvGraphicFramePr><xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId1"/></a:graphicData></a:graphic></graphicFrame><clientData/></oneCellAnchor></wsDr>');
+      // A graphic-frame transform may not be empty. Excel treats an empty
+      // xfrm as a corrupt drawing and removes the chart while repairing the
+      // workbook.
+      zip.file(drawingPath, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><wsDr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><oneCellAnchor><from><col>0</col><colOff>0</colOff><row>3</row><rowOff>0</rowOff></from><ext cx="9715500" cy="' + (chartHeight * 9525) + '"/><graphicFrame><nvGraphicFramePr><cNvPr id="' + id + '" name="Cycle Chart ' + id + '"/><cNvGraphicFramePr/></nvGraphicFramePr><xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId1"/></a:graphicData></a:graphic></graphicFrame><clientData/></oneCellAnchor></wsDr>');
       zip.file('xl/drawings/_rels/drawing' + id + '.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart' + id + '.xml"/></Relationships>');
       typesXml = typesXml.replace('</Types>', '<Override PartName="/xl/drawings/drawing' + id + '.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/><Override PartName="/xl/charts/chart' + id + '.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>');
       spec._parts = { sheetPath: sheetPath, relsPath: relsPath, drawingPath: drawingPath, id: id };
@@ -7685,7 +7689,16 @@ sap.ui.getCore().attachInit(function () {
       var sheetXml = await zip.file(parts.sheetPath).async('string');
       var relsFile = zip.file(parts.relsPath);
       var relsXml = relsFile ? await relsFile.async('string') : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
-      var relationshipId = 'rId' + ((relsXml.match(/<Relationship\b/g) || []).length + 1);
+      // Relationship IDs are not guaranteed to be consecutive. Counting
+      // elements can therefore reuse an existing ID and invalidate the sheet.
+      var usedRelationshipIds = {};
+      relsXml.replace(/\bId="(rId\d+)"/g, function (_, value) {
+        usedRelationshipIds[value] = true;
+        return _;
+      });
+      var relationshipNumber = 1;
+      while (usedRelationshipIds['rId' + relationshipNumber]) relationshipNumber += 1;
+      var relationshipId = 'rId' + relationshipNumber;
       relsXml = relsXml.replace('</Relationships>', '<Relationship Id="' + relationshipId + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing' + parts.id + '.xml"/></Relationships>');
       if (sheetXml.indexOf('xmlns:r=') === -1) sheetXml = sheetXml.replace('<worksheet ', '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ');
       var drawingTag = '<drawing r:id="' + relationshipId + '"/>';
@@ -7786,63 +7799,35 @@ sap.ui.getCore().attachInit(function () {
       return;
     }
     var exportTitle = _jobState.job_title || '';
-    var ops = (_projectOpMap[exportJob] || []).filter(function (op) {
-      return !!(op && String(op).trim());
+    var ops = (_projectOpMap[exportJob] || []).filter(function (op, index, values) {
+      return !!(op && String(op).trim()) && values.indexOf(op) === index;
     }).slice().sort(_alphabeticalCompare);
     if (!ops.length) { sap.m.MessageToast.show('Load a project before exporting a report.'); return; }
     if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
     oJobSelect.setEnabled(false);
     if (status) { status.style.display = 'block'; status.style.background = '#eaf3fb'; status.style.color = '#09528A'; status.textContent = 'Generating Excel report for Job # ' + exportJob + '...'; }
 
-    var missing = ops.filter(function (op) { return !_opTreeCache[op]; });
-    var load = Promise.resolve();
-    missing.forEach(function (op) {
-      load = load.then(function () {
-        if (_jobState.job_number !== exportJob) throw new Error('The selected job changed during export.');
-        return _fetchTreeToCache(op);
-      });
-    });
-    load.then(function () {
-      if (_jobState.job_number !== exportJob) throw new Error('The selected job changed during export.');
-      var workbook = _vtBuildExcelWorkbook(ops);
-      var safeName = (exportJob + (exportTitle ? '_' + exportTitle : ''))
-        .replace(/[\\/:*?"<>|]+/g, '_').trim();
-      return _vtAddExcelCharts(workbook).then(function (arrayBuffer) {
-        var blob = new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        var link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = (safeName || exportJob) + '_cycle_chart_report.xlsx';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(link.href);
-      });
-    })
-    .then(function () {
-      if (status) { status.style.background = '#f0faf0'; status.style.color = '#1a7a1a'; status.textContent = 'Excel report for Job # ' + exportJob + ' downloaded.'; }
-    })
-    .catch(function (err) {
-      if (status) { status.style.background = '#fff0f0'; status.style.color = '#cc0000'; status.textContent = 'Error: ' + err.message; }
-      sap.m.MessageToast.show('Export failed: ' + err.message);
-    })
-    .finally(function () {
-      oJobSelect.setEnabled(true);
-      if (btn) { btn.disabled = false; btn.textContent = 'Export Excel'; }
-    });
-    return;
-
-    fetch(API_BASE + '/report/excel', {
+    // Include the selected job in both the query string and request body. The
+    // report service must use it when reading operation rows because op_number
+    // values can be reused by different jobs.
+    var reportUrl = API_BASE + '/report/excel'
+      + '?project_number=' + encodeURIComponent(exportJob)
+      + '&proj_number=' + encodeURIComponent(exportJob)
+      + '&job_number=' + encodeURIComponent(exportJob);
+    var reportPayload = {
+      proj_number: exportJob,
+      project_number: exportJob,
+      job_number: exportJob,
+      proj_title: exportTitle,
+      project_title: exportTitle,
+      job_title: exportTitle,
+      op_numbers: ops.slice()
+    };
+    console.log('[vtExportExcel] POST ' + reportUrl, reportPayload);
+    fetch(reportUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        proj_number: exportJob,
-        project_number: exportJob,
-        job_number: exportJob,
-        proj_title: exportTitle,
-        project_title: exportTitle,
-        job_title: exportTitle,
-        op_numbers: ops.slice()
-      })
+      body: JSON.stringify(reportPayload)
     })
     .then(function (response) {
       if (!response.ok) {
@@ -7877,26 +7862,6 @@ sap.ui.getCore().attachInit(function () {
       oJobSelect.setEnabled(true);
       if (btn) { btn.disabled = false; btn.textContent = 'Export Excel'; }
     });
-    return;
-    var ops = oOpSelect.getItems().map(function (it) { return it.getKey(); }).filter(Boolean);
-    if (!ops.length) { sap.m.MessageToast.show('Load a project before exporting a report.'); return; }
-    if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
-    if (status) { status.style.display = 'block'; status.style.background = '#eaf3fb'; status.style.color = '#09528A'; status.textContent = 'Generating Excel report locally...'; }
-
-    var missing = ops.filter(function (op) { return !_opTreeCache[op]; });
-    var load = Promise.resolve();
-    missing.forEach(function (op) { load = load.then(function () { return _fetchTreeToCache(op); }); });
-    load.then(function () {
-      var workbook = _vtBuildExcelWorkbook(ops);
-      var safeName = ((_jobState.job_number || '') + '_' + (_jobState.job_title || '')).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'cycle_chart_report';
-      XLSX.writeFile(workbook, safeName + '_cycle_chart_report.xlsx');
-      if (status) { status.style.background = '#f0faf0'; status.style.color = '#1a7a1a'; status.textContent = 'Excel report downloaded.'; }
-    })
-    .catch(function (err) {
-      if (status) { status.style.background = '#fff0f0'; status.style.color = '#cc0000'; status.textContent = 'Error: ' + err.message; }
-      sap.m.MessageToast.show('Export failed: ' + err.message);
-    })
-    .finally(function () { if (btn) { btn.disabled = false; btn.textContent = 'Export Excel'; } });
     return;
     if (btn)    { btn.disabled = true; btn.textContent = 'Generating…'; }
     if (status) { status.style.display='block'; status.style.background='#eaf3fb'; status.style.color='#09528A'; status.textContent='Generating report — this may take a moment…'; }
