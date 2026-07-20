@@ -6015,7 +6015,7 @@ sap.ui.getCore().attachInit(function () {
       'Robot cycle':   '#EBDD6C',
       'Machine cycle': '#05DF72',
       'Manual cycle':  '#EB1E29',
-      'Operator wait': '#EB1E29'
+      'Operator wait': '#1EC2EB'
     };
     var machineResources  = _jobState.machine_list  || [];
     var robotResources    = _jobState.robot_list    || [];
@@ -6397,6 +6397,7 @@ sap.ui.getCore().attachInit(function () {
           + (allLoaded ? totalStations : totalStations + '+') + '</td>'
           + '<td colspan="2" style="padding:8px 12px;text-align:center;color:#888;font-size:0.76rem;">'
           + (notLoadedOps > 0 ? notLoadedOps + ' op(s) not yet opened in Design tab' : '') + '</td>'
+          + '<td style="padding:8px 12px;"></td>'
           + '<td style="padding:8px 12px;text-align:center;">'
           + (overTargetOps > 0
               ? '<span style="color:#cc0000;font-weight:700;font-size:0.8rem;">' + overTargetOps + ' over target</span>'
