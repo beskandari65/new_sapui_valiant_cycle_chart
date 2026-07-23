@@ -3360,7 +3360,7 @@ sap.ui.getCore().attachInit(function () {
                   return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + (ref.step || refId) + '</em></span>';
                 }
                 if (cond === RC_COND.CUSTOM_VALUE) {
-                  return '<span style="color:red"><strong>Cycle time:</strong> <em>' + valStr + 's</em></span>';
+                  return '<span style="color:red"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
                 }
                 if (cond === RC_COND.CYCLE_CALC) {
                   return '<span style="color:' + T + '"><em>' + valStr + '</em></span>';
@@ -3368,7 +3368,11 @@ sap.ui.getCore().attachInit(function () {
                 if (cond === RC_COND.PREDEFINED) {
                   var pdNameD  = vals[0] || '';
                   var pdFoundD = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pdNameD; })[0];
-                  return _predefinedCycleDetailsHtml(pdFoundD, pdNameD, T);
+                  var pdFormulaD = pdFoundD ? _cycleDetailsHtmlToPlainText(pdFoundD.details || '') : '';
+                  return '<span style="color:' + (pdFoundD ? T : 'red') + '"><strong>Predefined</strong>: <em>'
+                    + _cycleDetailsEscapeHtml(pdNameD)
+                    + (pdFoundD ? (pdFormulaD ? ' &mdash; ' + _cycleDetailsEscapeHtml(pdFormulaD) : '') : ' (not found)')
+                    + '</em></span>';
                 }
                 return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
               }
@@ -3530,7 +3534,7 @@ sap.ui.getCore().attachInit(function () {
                   return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + (ref.step || refId) + '</em></span>';
                 }
                 if (cond === RC_COND.CUSTOM_VALUE) {
-                  return '<span style="color:red"><strong>Cycle time:</strong> <em>' + valStr + 's</em></span>';
+                  return '<span style="color:red"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
                 }
                 if (cond === RC_COND.CYCLE_CALC) {
                   return '<span style="color:' + T + '"><em>' + valStr + '</em></span>';
@@ -3538,7 +3542,11 @@ sap.ui.getCore().attachInit(function () {
                 if (cond === RC_COND.PREDEFINED) {
                   var pdName  = vals[0] || '';
                   var pdFound = (_jobState.predefined_processes || []).filter(function (p) { return p.name === pdName; })[0];
-                  return _predefinedCycleDetailsHtml(pdFound, pdName, T);
+                  var pdFormula = pdFound ? _cycleDetailsHtmlToPlainText(pdFound.details || '') : '';
+                  return '<span style="color:' + (pdFound ? T : 'red') + '"><strong>Predefined</strong>: <em>'
+                    + _cycleDetailsEscapeHtml(pdName)
+                    + (pdFound ? (pdFormula ? ' &mdash; ' + _cycleDetailsEscapeHtml(pdFormula) : '') : ' (not found)')
+                    + '</em></span>';
                 }
                 return '<span style="color:' + T + '"><strong>' + cond + '</strong>: <em>' + valStr + 's</em></span>';
               }
