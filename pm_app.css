@@ -70,6 +70,27 @@
 .vtPmBtnSuccess:hover { background: #0b6b34; color: #fff; }
 .vtPmBtnDanger { color: #bb0000; }
 .vtPmToolbarSpacer { flex: 1 1 auto; }
+.vtPmStructureTools {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid #d3dee5;
+  border-radius: 6px;
+  background: #f7fafc;
+}
+.vtPmStructureLabel {
+  color: #5f7484;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.vtPmQuantity {
+  width: 58px;
+  min-width: 58px;
+  text-align: center;
+}
 
 .vtPmStatus {
   display: none;
@@ -181,6 +202,13 @@
 
 .vtPmTaskRow:hover { background: #f8fbfd; }
 .vtPmTaskRow.vtPmConflict { background: #fff7df; }
+.vtPmTaskRow.vtPmSelected {
+  background: #e7f2fb;
+  box-shadow: inset 4px 0 0 #0a6ed1;
+}
+.vtPmTaskRow.vtPmSelected.vtPmConflict {
+  background: #fff0bd;
+}
 .vtPmIndex { justify-content: center; color: #82929e; }
 .vtPmTaskTitle { font-weight: 600; color: #203f56; }
 .vtPmTaskTitle[data-depth="1"] { padding-left: 24px; }
@@ -312,4 +340,3 @@
   .vtPmDialogBody { grid-template-columns: 1fr; }
   .vtPmFieldFull { grid-column: auto; }
 }
-

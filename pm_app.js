@@ -11,6 +11,8 @@
     resources: [],
     conflicts: [],
     dirty: false,
+    selectedTaskId: "",
+    lastAddedTaskId: "",
     dayWidth: 34
   };
 
@@ -113,7 +115,14 @@
           '<div class="vtPmBrand"><strong>Project Management</strong><span>Working-day project schedule</span></div>',
           '<select id="vtPmProjectSelect" class="vtPmProjectSelect" aria-label="PM project">', projectOptions(), '</select>',
           '<button class="vtPmBtn vtPmBtnPrimary" data-action="new-project">+ New Project</button>',
-          '<button class="vtPmBtn" data-action="new-task">+ New Task</button>',
+          '<div class="vtPmStructureTools">',
+            '<span class="vtPmStructureLabel">Task structure</span>',
+            '<button class="vtPmBtn" data-action="add-above" title="Add task(s) above selected task">Add Above</button>',
+            '<button class="vtPmBtn" data-action="add-below" title="Add task(s) below selected task">Add Below</button>',
+            '<button class="vtPmBtn vtPmBtnPrimary" data-action="add-subtask" title="Add task(s) under selected task">New Subtask</button>',
+            '<button class="vtPmBtn vtPmBtnDanger" data-action="delete-selected" title="Delete selected task and its subtasks">Delete</button>',
+            '<input id="vtPmTaskQuantity" class="vtPmQuantity" type="number" min="1" max="100" step="1" value="1" aria-label="Number of tasks">',
+          '</div>',
           '<button class="vtPmBtn" data-action="new-resource">Resources</button>',
           '<span class="vtPmToolbarSpacer"></span>',
           '<button class="vtPmBtn" data-action="check-conflicts">Check Resources</button>',
@@ -257,7 +266,7 @@
           var predecessor = dependency && map[dependency.predecessor_id];
           var progress = Math.max(0, Math.min(100, Number(task.progress_percent) || 0));
           return [
-            '<div class="vtPmTaskRow', conflictTasks[task.task_id] ? " vtPmConflict" : "", '" data-task-id="', escapeHtml(task.task_id), '">',
+            '<div class="vtPmTaskRow', conflictTasks[task.task_id] ? " vtPmConflict" : "", state.selectedTaskId === task.task_id ? " vtPmSelected" : "", '" data-task-id="', escapeHtml(task.task_id), '">',
               '<div class="vtPmCell vtPmIndex">', index + 1, "</div>",
               '<div class="vtPmCell vtPmTaskTitle" data-depth="', taskDepth(task, map), '">',
                 '<span>', escapeHtml(task.title), "</span>",
@@ -421,6 +430,123 @@
     }, existing ? "Update Task" : "Add Task");
   }
 
+  function subtreeEndIndex(taskId) {
+    var tasks = state.chart.tasks || [];
+    var rootIndex = tasks.findIndex(function (task) { return task.task_id === taskId; });
+    if (rootIndex < 0) return tasks.length;
+    var descendants = {};
+    descendants[taskId] = true;
+    var end = rootIndex + 1;
+    for (var index = rootIndex + 1; index < tasks.length; index++) {
+      var task = tasks[index];
+      if (task.parent_id && descendants[task.parent_id]) {
+        descendants[task.task_id] = true;
+        end = index + 1;
+      } else {
+        break;
+      }
+    }
+    return end;
+  }
+
+  function previousSibling(parentId, insertionIndex) {
+    var tasks = state.chart.tasks || [];
+    for (var index = insertionIndex - 1; index >= 0; index--) {
+      if ((tasks[index].parent_id || null) === (parentId || null)) return tasks[index];
+    }
+    return null;
+  }
+
+  function defaultTask(parentId, insertionIndex) {
+    var projectStart = state.chart.project.start_date || isoDate(new Date());
+    var previous = previousSibling(parentId, insertionIndex);
+    var start = projectStart;
+    if (previous && previous.end_date) {
+      var next = addCalendarDays(parseDate(previous.end_date), 1);
+      while (next.getUTCDay() === 0 || next.getUTCDay() === 6) {
+        next = addCalendarDays(next, 1);
+      }
+      start = isoDate(next);
+    }
+    var task = {
+      task_id: uid("pmtask"),
+      parent_id: parentId || null,
+      tree_index: insertionIndex,
+      title: "New Task",
+      description: "",
+      start_date: start,
+      duration_value: 1,
+      duration_unit: "working_days",
+      progress_percent: 0,
+      task_type: "task",
+      color: "#0a6ed1",
+      cc_item_id: null
+    };
+    task.end_date = calculateEnd(task);
+    return { task: task, previous: previous };
+  }
+
+  function addTasksAt(mode) {
+    if (!state.chart) {
+      openProjectDialog();
+      return;
+    }
+    var tasks = state.chart.tasks || (state.chart.tasks = []);
+    var quantityInput = state.root.querySelector("#vtPmTaskQuantity");
+    var quantity = Math.max(1, Math.min(100, Math.floor(Number(quantityInput && quantityInput.value) || 1)));
+    if (quantityInput) quantityInput.value = quantity;
+    var selected = tasks.find(function (task) { return task.task_id === state.selectedTaskId; });
+
+    if ((mode === "above" || mode === "below") && !selected) {
+      setStatus("Select a task row first", "warning");
+      return;
+    }
+
+    // Match Cycle Chart behavior: with no row selected, New Subtask starts a
+    // new top-level task. Repeated clicks after an auto-added child create
+    // siblings under the same parent rather than nesting indefinitely.
+    var parentId = null;
+    var insertionIndex = tasks.length;
+    if (mode === "subtask" && selected) {
+      if (selected.task_id === state.lastAddedTaskId && selected.parent_id) {
+        parentId = selected.parent_id;
+        insertionIndex = subtreeEndIndex(selected.task_id);
+      } else {
+        parentId = selected.task_id;
+        insertionIndex = subtreeEndIndex(selected.task_id);
+      }
+    } else if (mode === "above" && selected) {
+      parentId = selected.parent_id || null;
+      insertionIndex = tasks.indexOf(selected);
+    } else if (mode === "below" && selected) {
+      parentId = selected.parent_id || null;
+      insertionIndex = subtreeEndIndex(selected.task_id);
+    }
+
+    var createdIds = [];
+    for (var count = 0; count < quantity; count++) {
+      var built = defaultTask(parentId, insertionIndex);
+      tasks.splice(insertionIndex, 0, built.task);
+      createdIds.push(built.task.task_id);
+      if (built.previous) {
+        state.chart.dependencies.push({
+          predecessor_id: built.previous.task_id,
+          successor_id: built.task.task_id,
+          dependency_type: "FS",
+          lag_value: 0,
+          lag_unit: "working_days"
+        });
+      }
+      insertionIndex = subtreeEndIndex(built.task.task_id);
+    }
+    state.selectedTaskId = createdIds[createdIds.length - 1];
+    state.lastAddedTaskId = state.selectedTaskId;
+    markDirty();
+    renderBoard();
+    setStatus(quantity + (quantity === 1 ? " task added" : " tasks added") + ". Edit the selected task to set its details.", "success");
+    if (quantity === 1) openTaskDialog(state.selectedTaskId);
+  }
+
   function openResourceDialog() {
     modal("Add internal resource", [
       '<div class="vtPmField vtPmFieldFull"><label>Resource name</label><input id="pmResourceName" required placeholder="Controls Engineering"></div>',
@@ -465,6 +591,8 @@
     state.chart.assignments = state.chart.assignments.filter(function (assignment) {
       return !ids[assignment.task_id];
     });
+    if (ids[state.selectedTaskId]) state.selectedTaskId = "";
+    if (ids[state.lastAddedTaskId]) state.lastAddedTaskId = "";
     markDirty();
     renderBoard();
   }
@@ -543,6 +671,8 @@
       state.projectId = projectId;
       state.chart = chart;
       state.conflicts = [];
+      state.selectedTaskId = "";
+      state.lastAddedTaskId = "";
       state.dirty = false;
       renderProjectSelect();
       renderBoard();
@@ -579,15 +709,35 @@
     });
     state.root.addEventListener("click", function (event) {
       var button = event.target.closest("[data-action]");
-      if (!button) return;
+      if (!button) {
+        var row = event.target.closest(".vtPmTaskRow");
+        if (row) {
+          state.selectedTaskId = row.getAttribute("data-task-id") || "";
+          state.lastAddedTaskId = "";
+          renderBoard();
+        }
+        return;
+      }
       var action = button.getAttribute("data-action");
       if (action === "new-project") openProjectDialog();
-      if (action === "new-task") openTaskDialog("");
+      if (action === "add-above") addTasksAt("above");
+      if (action === "add-below") addTasksAt("below");
+      if (action === "add-subtask") addTasksAt("subtask");
+      if (action === "delete-selected") {
+        if (state.selectedTaskId) deleteTask(state.selectedTaskId);
+        else setStatus("Select a task row first", "warning");
+      }
       if (action === "edit-task") openTaskDialog(button.getAttribute("data-task-id"));
       if (action === "delete-task") deleteTask(button.getAttribute("data-task-id"));
       if (action === "new-resource") openResourceDialog();
       if (action === "save") saveChart();
       if (action === "check-conflicts") checkConflicts();
+    });
+    state.root.addEventListener("keydown", function (event) {
+      if (event.shiftKey && (event.key === "P" || event.key === "p")) {
+        event.preventDefault();
+        addTasksAt("subtask");
+      }
     });
   }
 
@@ -605,4 +755,3 @@
 
   window.VTPM = { mount: mount };
 })();
-
