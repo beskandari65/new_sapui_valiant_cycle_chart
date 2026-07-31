@@ -17,6 +17,8 @@
   <script src="https://unpkg.com/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <link rel="stylesheet" href="/pm_app.css">
+  <script src="/pm_app.js"></script>
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
 
@@ -249,6 +251,24 @@
     .vtSaveWarning { font-style: italic; }
     .vtSaveDialog .sapMDialogScrollCont { padding: 0.75rem 1rem !important; }
     .vtSaveDialog .sapMDialogSection { padding: 0 !important; }
+
+    /* Application mode selector */
+    .vtModePage,
+    .vtModePage > section { background:linear-gradient(145deg,#eef5fa 0%,#f8fafc 50%,#e7f0f7 100%) !important; }
+    .vtModeHero { height:100%; box-sizing:border-box; padding:7vh 28px 5vh; }
+    .vtModeEyebrow { color:#0a6ed1 !important; font-size:0.78rem !important; font-weight:700 !important; letter-spacing:0.16em; text-transform:uppercase; margin-bottom:12px; }
+    .vtModeTitle { color:#12344d !important; font-size:2.35rem !important; line-height:1.15 !important; font-weight:700 !important; text-align:center !important; }
+    .vtModeSubtitle { color:#536b7d !important; font-size:1rem !important; line-height:1.5 !important; text-align:center !important; max-width:650px; margin:12px auto 38px; }
+    .vtModeChoices { gap:22px; justify-content:center; flex-wrap:wrap; }
+    .vtModeButton.sapMBtn { width:330px !important; height:190px !important; }
+    .vtModeButton .sapMBtnInner { width:100% !important; height:100% !important; border-radius:14px !important; border:1px solid #c7d7e4 !important; background:#fff !important; box-shadow:0 10px 28px rgba(35,73,101,0.13); transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease; }
+    .vtModeButton .sapMBtnInner:hover { transform:translateY(-4px); box-shadow:0 16px 34px rgba(35,73,101,0.2); border-color:#0a6ed1 !important; }
+    .vtModeButton .sapMBtnContent { display:flex !important; align-items:center; justify-content:center; height:100% !important; line-height:1.25 !important; white-space:normal !important; font-size:1.28rem !important; font-weight:700 !important; color:#12344d !important; padding:76px 22px 16px !important; }
+    .vtModeButton .sapMBtnIcon { position:absolute; left:50%; top:38px; transform:translateX(-50%); font-size:2.4rem !important; color:#0a6ed1 !important; }
+    .vtModeButtonPm .sapMBtnInner { border-top:5px solid #0a6ed1 !important; }
+    .vtModeButtonCc .sapMBtnInner { border-top:5px solid #107e3e !important; }
+    .vtModeButtonCc .sapMBtnIcon { color:#107e3e !important; }
+    .vtModeFooter { color:#71889a !important; font-size:0.78rem !important; margin-top:34px; }
   </style>
 </head>
 <body class="sapUiBody">
@@ -8097,10 +8117,17 @@ sap.ui.getCore().attachInit(function () {
 
 
   // ── Page / App ────────────────────────────────────────────────────────────
+  var oModeBackBtn = new sap.m.Button({
+    icon: "sap-icon://nav-back",
+    type: "Transparent",
+    tooltip: "Choose application",
+    press: function () { oApp.to(oModePage.getId()); }
+  });
+
   var oPage = new sap.m.Page({
     showNavButton: false,
     customHeader: new sap.m.Bar({
-      contentLeft:  [oJobHBox, oOpHBox, oUndoBtn, oRedoBtn, oTabBarSaveBtn],
+      contentLeft:  [oModeBackBtn, oJobHBox, oOpHBox, oUndoBtn, oRedoBtn, oTabBarSaveBtn],
       contentRight: [
         new sap.m.Text({ text: "ValiantTMS — Cycle Chart Management", wrapping: false })
           .addStyleClass("vtPageTitle"),
@@ -8113,7 +8140,66 @@ sap.ui.getCore().attachInit(function () {
     content: [oIconTabBar]
   });
 
-  new sap.m.App({ pages: [oPage] }).placeAt("content");
+  var oPmPage = new sap.m.Page({
+    title: "Project Management",
+    showNavButton: true,
+    navButtonPress: function () { oApp.to(oModePage.getId()); },
+    content: [
+      new sap.ui.core.HTML({
+        sanitizeContent: false,
+        content: '<div id="vtPmAppRoot" style="height:100%;"></div>',
+        afterRendering: function () {
+          if (window.VTPM) window.VTPM.mount("vtPmAppRoot");
+        }
+      })
+    ]
+  });
+
+  var oModePage = new sap.m.Page({
+    showHeader: false,
+    enableScrolling: false,
+    content: [
+      new sap.m.VBox({
+        height: "100%",
+        alignItems: "Center",
+        justifyContent: "Center",
+        items: [
+          new sap.m.Text({ text: "VALIANT TMS" }).addStyleClass("vtModeEyebrow"),
+          new sap.m.Title({ text: "Choose your workspace", level: "H1" })
+            .addStyleClass("vtModeTitle"),
+          new sap.m.Text({
+            text: "Plan the delivery of a production line or design the finished process for your customer.",
+            wrapping: true
+          }).addStyleClass("vtModeSubtitle"),
+          new sap.m.HBox({
+            justifyContent: "Center",
+            wrap: "Wrap",
+            items: [
+              new sap.m.Button({
+                text: "Project Management",
+                icon: "sap-icon://project-definition-triangle",
+                press: function () { oApp.to(oPmPage.getId()); }
+              }).addStyleClass("vtModeButton vtModeButtonPm"),
+              new sap.m.Button({
+                text: "Cycle Chart Management",
+                icon: "sap-icon://process",
+                press: function () { oApp.to(oPage.getId()); }
+              }).addStyleClass("vtModeButton vtModeButtonCc")
+            ]
+          }).addStyleClass("vtModeChoices"),
+          new sap.m.Text({
+            text: "Both workspaces use the same ValiantTMS platform."
+          }).addStyleClass("vtModeFooter")
+        ]
+      }).addStyleClass("vtModeHero")
+    ]
+  }).addStyleClass("vtModePage");
+
+  var oApp = new sap.m.App({
+    initialPage: oModePage.getId(),
+    pages: [oModePage, oPage, oPmPage]
+  });
+  oApp.placeAt("content");
 
   // ── Mount toggle + Save buttons into the right side of the tab strip ────────
   // ── Global keyboard + background-click handlers ───────────────────────────

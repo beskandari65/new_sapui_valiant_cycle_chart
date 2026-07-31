@@ -18,6 +18,8 @@ import datetime
 import sqlite3
 import uuid
 
+from pm_api import create_pm_blueprint
+
 try:
     import xlsxwriter as _xlw
     _HAS_XLSXWRITER = True
@@ -171,6 +173,10 @@ def _make_excel_report(proj_num, proj_title, target_ct, ops_data):
 # Leave as None to use the embedded sample data below.
 DB_PATH    = os.environ.get("DB_PATH") or None  # e.g. r"C:\path\to\your\chart.db"
 TABLE_NAME = os.environ.get("TABLE_NAME", "cycle_general_structure")
+
+# PM uses separate domain tables in the same SQLite database.  Registering the
+# blueprint does not create or change any Cycle Chart table.
+app.register_blueprint(create_pm_blueprint(lambda: DB_PATH))
 
 # ── Sample data ───────────────────────────────────────────────────────────────
 SAMPLE_DATA = [
@@ -441,6 +447,14 @@ ITEMS_DETAILS = {}  # op_number → list of station stat dicts
 @app.route("/")
 def index():
     return send_file("cycle_chart.html")
+
+@app.route("/pm_app.js")
+def pm_app_javascript():
+    return send_file("pm_app.js", mimetype="application/javascript")
+
+@app.route("/pm_app.css")
+def pm_app_stylesheet():
+    return send_file("pm_app.css", mimetype="text/css")
 
 @app.route("/api/op_numbers")
 def api_op_numbers():
@@ -723,11 +737,25 @@ def api_update_project_numbers():
         for pn in op_numbers_map:
             project_meta_map[pn] = dict(JOB_METADATA, project_no=pn)
 
-    return jsonify({
-        "data": {
-            "op_numbers":       op_numbers_map,
-            "project_metadata": project_meta_map,
+    # Keep the response contract used by the original FastAPI client:
+    # data is keyed directly by project number. Returning the two internal maps
+    # as top-level data keys makes the UI mistake "op_numbers" and
+    # "project_metadata" for actual job numbers.
+    project_data = {}
+    for project_no in sorted(
+        set(op_numbers_map) | set(project_meta_map),
+        key=str,
+    ):
+        project_data[project_no] = {
+            "op_list": op_numbers_map.get(project_no, []),
+            "proj_data": project_meta_map.get(project_no),
         }
+
+    return jsonify({
+        "request_title": "update_project",
+        "status": "ok",
+        "data": project_data,
+        "message": "",
     })
 
 

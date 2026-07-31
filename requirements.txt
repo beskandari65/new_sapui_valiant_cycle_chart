@@ -1,0 +1,5 @@
+fastapi
+flask
+uvicorn
+xlsxwriter
+a2wsgi

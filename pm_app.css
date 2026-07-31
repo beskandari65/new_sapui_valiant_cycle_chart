@@ -1,0 +1,315 @@
+.vtPmWorkspace {
+  height: calc(100vh - 2.75rem);
+  display: flex;
+  flex-direction: column;
+  background: #f4f7f9;
+  color: #203446;
+  font-family: "72", Arial, sans-serif;
+}
+
+.vtPmToolbar {
+  min-height: 58px;
+  padding: 9px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: #fff;
+  border-bottom: 1px solid #dce4ea;
+  box-shadow: 0 2px 7px rgba(31, 61, 82, 0.07);
+}
+
+.vtPmBrand {
+  margin-right: 12px;
+}
+
+.vtPmBrand strong {
+  display: block;
+  color: #12344d;
+  font-size: 1rem;
+}
+
+.vtPmBrand span {
+  color: #718494;
+  font-size: 0.72rem;
+}
+
+.vtPmToolbar select,
+.vtPmToolbar input,
+.vtPmDialog input,
+.vtPmDialog select {
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid #b8c7d1;
+  border-radius: 5px;
+  background: #fff;
+  color: #203446;
+  font: inherit;
+}
+
+.vtPmProjectSelect {
+  min-width: 245px;
+}
+
+.vtPmBtn {
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid #aebfca;
+  border-radius: 5px;
+  background: #fff;
+  color: #23445c;
+  cursor: pointer;
+  font: 600 0.78rem "72", Arial, sans-serif;
+}
+
+.vtPmBtn:hover { background: #edf5fb; border-color: #0a6ed1; }
+.vtPmBtnPrimary { background: #0a6ed1; border-color: #0a6ed1; color: #fff; }
+.vtPmBtnPrimary:hover { background: #085caf; color: #fff; }
+.vtPmBtnSuccess { background: #107e3e; border-color: #107e3e; color: #fff; }
+.vtPmBtnSuccess:hover { background: #0b6b34; color: #fff; }
+.vtPmBtnDanger { color: #bb0000; }
+.vtPmToolbarSpacer { flex: 1 1 auto; }
+
+.vtPmStatus {
+  display: none;
+  padding: 8px 16px;
+  border-bottom: 1px solid transparent;
+  font-size: 0.78rem;
+}
+
+.vtPmStatus.show { display: block; }
+.vtPmStatus.info { background: #eaf3fb; border-color: #bed8ec; color: #174a70; }
+.vtPmStatus.success { background: #e5f4ea; border-color: #b5dbc3; color: #176334; }
+.vtPmStatus.warning { background: #fff3cd; border-color: #ead38a; color: #6f5510; }
+.vtPmStatus.error { background: #fde8e7; border-color: #e7bab7; color: #9a1c16; }
+
+.vtPmEmpty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  text-align: center;
+}
+
+.vtPmEmptyCard {
+  width: min(570px, 90%);
+  padding: 42px;
+  background: #fff;
+  border: 1px solid #dbe4ea;
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgba(31, 61, 82, 0.1);
+}
+
+.vtPmEmptyCard h2 { margin: 0 0 9px; color: #12344d; }
+.vtPmEmptyCard p { margin: 0 0 22px; color: #657b8c; line-height: 1.5; }
+
+.vtPmBoard {
+  flex: 1;
+  min-height: 0;
+  display: none;
+  flex-direction: column;
+}
+
+.vtPmBoard.show { display: flex; }
+
+.vtPmSummary {
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  background: #eef5fa;
+  border-bottom: 1px solid #d7e3ec;
+  font-size: 0.78rem;
+  color: #48657a;
+}
+
+.vtPmSummary strong { color: #12344d; }
+
+.vtPmGridWrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.vtPmGrid {
+  min-width: 1180px;
+  background: #fff;
+  border: 1px solid #d9e2e8;
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.vtPmGridHeader,
+.vtPmTaskRow {
+  display: grid;
+  grid-template-columns: 42px 280px 120px 90px 105px 115px 175px minmax(430px, 1fr);
+  min-height: 42px;
+  align-items: stretch;
+}
+
+.vtPmGridHeader {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  min-height: 45px;
+  color: #3c5364;
+  background: #edf2f5;
+  border-bottom: 1px solid #cdd9e1;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.vtPmCell {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 7px 8px;
+  display: flex;
+  align-items: center;
+  border-right: 1px solid #e6ecef;
+}
+
+.vtPmTaskRow {
+  position: relative;
+  min-height: 46px;
+  border-bottom: 1px solid #edf1f3;
+  font-size: 0.78rem;
+}
+
+.vtPmTaskRow:hover { background: #f8fbfd; }
+.vtPmTaskRow.vtPmConflict { background: #fff7df; }
+.vtPmIndex { justify-content: center; color: #82929e; }
+.vtPmTaskTitle { font-weight: 600; color: #203f56; }
+.vtPmTaskTitle[data-depth="1"] { padding-left: 24px; }
+.vtPmTaskTitle[data-depth="2"] { padding-left: 42px; }
+.vtPmMuted { color: #7a8c99; }
+
+.vtPmProgressTrack {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #e2e9ed;
+}
+
+.vtPmProgressFill { height: 100%; background: #107e3e; }
+.vtPmProgressText { margin-left: 6px; min-width: 31px; font-size: 0.7rem; }
+
+.vtPmGanttHead,
+.vtPmGanttCell {
+  position: relative;
+  min-height: 100%;
+  overflow: hidden;
+  background-image: linear-gradient(to right, rgba(148, 166, 178, .2) 1px, transparent 1px);
+}
+
+.vtPmGanttHead { background-color: #f4f7f9; }
+.vtPmGanttAxis {
+  position: absolute;
+  inset: 0;
+  display: flex;
+}
+
+.vtPmGanttDay {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  padding: 5px 2px;
+  border-right: 1px solid #d8e1e7;
+  text-align: center;
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: #617887;
+}
+
+.vtPmGanttDay.weekend { background: rgba(125, 140, 150, 0.08); color: #97a4ad; }
+
+.vtPmBar {
+  position: absolute;
+  top: 11px;
+  height: 23px;
+  min-width: 5px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #0a6ed1;
+  box-shadow: inset 0 0 0 1px rgba(0, 43, 79, 0.18);
+  color: #fff;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.68rem;
+  line-height: 23px;
+  padding: 0 7px;
+  box-sizing: border-box;
+}
+
+.vtPmBarProgress {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(16, 126, 62, 0.68);
+}
+
+.vtPmBarLabel { position: relative; z-index: 1; }
+.vtPmRowActions { margin-left: auto; display: flex; gap: 2px; }
+.vtPmIconBtn { border: 0; background: transparent; color: #587184; cursor: pointer; padding: 4px; }
+.vtPmIconBtn:hover { color: #0a6ed1; }
+
+.vtPmModalBackdrop {
+  position: fixed;
+  z-index: 10020;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 42, 57, 0.48);
+}
+
+.vtPmDialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 50px);
+  overflow: auto;
+  padding: 0;
+  background: #fff;
+  border-radius: 9px;
+  box-shadow: 0 20px 55px rgba(12, 31, 44, 0.28);
+}
+
+.vtPmDialogHeader {
+  padding: 15px 18px;
+  border-bottom: 1px solid #dfe6eb;
+  color: #12344d;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.vtPmDialogBody {
+  padding: 17px 18px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 13px;
+}
+
+.vtPmField { display: flex; flex-direction: column; gap: 5px; }
+.vtPmFieldFull { grid-column: 1 / -1; }
+.vtPmField label { color: #536b7d; font-size: 0.72rem; font-weight: 700; }
+.vtPmField input,
+.vtPmField select { width: 100%; }
+.vtPmDialogFooter {
+  padding: 12px 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid #dfe6eb;
+}
+
+.vtPmConflictList { margin: 0; padding-left: 20px; color: #5d4c15; line-height: 1.55; }
+
+@media (max-width: 760px) {
+  .vtPmToolbar { align-items: stretch; }
+  .vtPmProjectSelect { flex: 1 1 100%; }
+  .vtPmDialogBody { grid-template-columns: 1fr; }
+  .vtPmFieldFull { grid-column: auto; }
+}
+
