@@ -150,6 +150,7 @@ class PMDatabase:
                     color TEXT,
                     calendar_id TEXT,
                     cc_item_id TEXT,
+                    schedule_config TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (project_id) REFERENCES pm_projects(project_id)
@@ -216,6 +217,54 @@ class PMDatabase:
                 CREATE INDEX IF NOT EXISTS idx_pm_assignments_resource
                     ON pm_task_assignments(resource_id);
 
+                CREATE TABLE IF NOT EXISTS pm_activity_log (
+                    activity_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    task_id TEXT,
+                    task_title TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY (project_id) REFERENCES pm_projects(project_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pm_activity_project
+                    ON pm_activity_log(project_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS pm_issues (
+                    issue_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    priority TEXT NOT NULL DEFAULT 'Medium',
+                    owner TEXT NOT NULL DEFAULT '',
+                    due_date TEXT,
+                    status TEXT NOT NULL DEFAULT 'Open',
+                    resolution_note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (project_id) REFERENCES pm_projects(project_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (task_id) REFERENCES pm_tasks(task_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pm_issues_project
+                    ON pm_issues(project_id, status, due_date);
+
+                CREATE TABLE IF NOT EXISTS pm_issue_history (
+                    history_id TEXT PRIMARY KEY,
+                    issue_id TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY (issue_id) REFERENCES pm_issues(issue_id)
+                        ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS pm_deliverables (
                     deliverable_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -237,6 +286,14 @@ class PMDatabase:
                     ON pm_deliverables(project_id);
                 """
             )
+            task_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(pm_tasks)")
+            }
+            if "schedule_config" not in task_columns:
+                conn.execute(
+                    "ALTER TABLE pm_tasks ADD COLUMN schedule_config "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
             current = conn.execute(
                 "SELECT version FROM pm_schema_version LIMIT 1"
             ).fetchone()
@@ -355,7 +412,7 @@ class PMDatabase:
                     """
                     SELECT * FROM pm_tasks
                     WHERE project_id = ?
-                    ORDER BY parent_id, tree_index, task_id
+                    ORDER BY tree_index, task_id
                     """,
                     (project_id,),
                 ).fetchall()
@@ -422,6 +479,14 @@ class PMDatabase:
         dependencies = payload.get("dependencies") or []
         assignments = payload.get("assignments") or []
         deliverables = payload.get("deliverables") or []
+        activity_log_requests = payload.get("activity_log_requests") or []
+        requested_logs = {
+            str(item.get("task_id") or ""): str(item.get("reason") or "").strip()
+            for item in activity_log_requests
+            if isinstance(item, dict)
+            and item.get("task_id")
+            and str(item.get("reason") or "").strip()
+        }
         if not isinstance(tasks, list):
             raise PMValidationError("tasks must be an array")
 
@@ -460,6 +525,39 @@ class PMDatabase:
             ).fetchone()
             if existing is None:
                 raise PMNotFoundError(f"PM project {project_id!r} was not found")
+
+            previous_tasks = {
+                row["task_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM pm_tasks WHERE project_id = ?", (project_id,)
+                ).fetchall()
+            }
+            previous_dependencies = {
+                (
+                    row["predecessor_id"], row["successor_id"],
+                    row["dependency_type"], float(row["lag_value"]),
+                    row["lag_unit"],
+                )
+                for row in conn.execute(
+                    """
+                    SELECT d.* FROM pm_task_dependencies d
+                    JOIN pm_tasks t ON t.task_id = d.successor_id
+                    WHERE t.project_id = ?
+                    """,
+                    (project_id,),
+                ).fetchall()
+            }
+            previous_issues = self._rows(conn.execute(
+                "SELECT * FROM pm_issues WHERE project_id = ?", (project_id,)
+            ).fetchall())
+            previous_issue_history = self._rows(conn.execute(
+                """
+                SELECT h.* FROM pm_issue_history h
+                JOIN pm_issues i ON i.issue_id = h.issue_id
+                WHERE i.project_id = ?
+                """,
+                (project_id,),
+            ).fetchall())
 
             editable = {
                 "title": project.get("title"),
@@ -504,8 +602,9 @@ class PMDatabase:
                             task_id, project_id, parent_id, tree_index, title,
                             description, start_date, end_date, duration_value,
                             duration_unit, progress_percent, task_type, color,
-                            calendar_id, cc_item_id, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            calendar_id, cc_item_id, schedule_config,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             task["task_id"], project_id, parent_id,
@@ -522,7 +621,11 @@ class PMDatabase:
                             float(task.get("progress_percent", 0)),
                             str(task.get("task_type") or "task"),
                             task.get("color"), task.get("calendar_id"),
-                            task.get("cc_item_id"), now, now,
+                            task.get("cc_item_id"),
+                            json.dumps(task.get("schedule_config") or {})
+                            if not isinstance(task.get("schedule_config"), str)
+                            else task.get("schedule_config"),
+                            now, now,
                         ),
                     )
                     inserted.add(task["task_id"])
@@ -530,6 +633,45 @@ class PMDatabase:
                     progressed = True
                 if not progressed:
                     raise PMValidationError("task hierarchy contains a cycle")
+
+            for issue in previous_issues:
+                if issue["task_id"] not in task_ids:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO pm_issues (
+                        issue_id, project_id, task_id, title, description,
+                        priority, owner, due_date, status, resolution_note,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        issue["issue_id"], issue["project_id"], issue["task_id"],
+                        issue["title"], issue["description"], issue["priority"],
+                        issue["owner"], issue["due_date"], issue["status"],
+                        issue["resolution_note"], issue["created_at"],
+                        issue["updated_at"],
+                    ),
+                )
+            restored_issue_ids = {
+                issue["issue_id"] for issue in previous_issues
+                if issue["task_id"] in task_ids
+            }
+            for history in previous_issue_history:
+                if history["issue_id"] not in restored_issue_ids:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO pm_issue_history (
+                        history_id, issue_id, changed_at, action, details_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        history["history_id"], history["issue_id"],
+                        history["changed_at"], history["action"],
+                        history["details_json"],
+                    ),
+                )
 
             for dep in dependencies:
                 predecessor = str(dep.get("predecessor_id") or "")
@@ -552,6 +694,108 @@ class PMDatabase:
                         str(dep.get("lag_unit") or "working_days"),
                     ),
                 )
+
+            activity_events: list[dict[str, Any]] = []
+            next_tasks = {task["task_id"]: task for task in normalized_tasks}
+            for task_id, task in next_tasks.items():
+                if task_id not in previous_tasks:
+                    activity_events.append({
+                        "event_type": "task_added",
+                        "task_id": task_id,
+                        "task_title": task.get("title"),
+                        "details": {"task": task.get("title")},
+                    })
+                    continue
+                old = previous_tasks[task_id]
+                changes: dict[str, Any] = {}
+                for field in (
+                    "title", "parent_id", "start_date", "end_date",
+                    "duration_value", "progress_percent", "task_type",
+                    "color", "schedule_config",
+                ):
+                    before = old.get(field)
+                    after = task.get(field)
+                    if field in ("duration_value", "progress_percent"):
+                        before = float(before or 0)
+                        after = float(after or 0)
+                    if field == "task_type":
+                        before = str(before or "task")
+                        after = str(after or "task")
+                    if field == "schedule_config":
+                        try:
+                            before_config = (
+                                json.loads(before) if isinstance(before, str)
+                                else (before or {})
+                            )
+                        except (TypeError, json.JSONDecodeError):
+                            before_config = {}
+                        try:
+                            after_config = (
+                                json.loads(after) if isinstance(after, str)
+                                else (after or {})
+                            )
+                        except (TypeError, json.JSONDecodeError):
+                            after_config = {}
+                        before = json.dumps(before_config, sort_keys=True)
+                        after = json.dumps(after_config, sort_keys=True)
+                    if before != after:
+                        changes[field] = {"before": before, "after": after}
+                if changes:
+                    activity_events.append({
+                        "event_type": "task_updated",
+                        "task_id": task_id,
+                        "task_title": task.get("title"),
+                        "details": {"changes": changes},
+                    })
+            for task_id, task in previous_tasks.items():
+                if task_id not in next_tasks:
+                    activity_events.append({
+                        "event_type": "task_deleted",
+                        "task_id": task_id,
+                        "task_title": task.get("title"),
+                        "details": {"task": task.get("title")},
+                    })
+            next_dependencies = {
+                (
+                    str(dep.get("predecessor_id") or ""),
+                    str(dep.get("successor_id") or ""),
+                    str(dep.get("dependency_type") or "FS"),
+                    float(dep.get("lag_value", 0)),
+                    str(dep.get("lag_unit") or "working_days"),
+                )
+                for dep in dependencies
+            }
+            added_dependencies = sorted(next_dependencies - previous_dependencies)
+            removed_dependencies = sorted(previous_dependencies - next_dependencies)
+            if added_dependencies or removed_dependencies:
+                activity_events.append({
+                    "event_type": "dependencies_changed",
+                    "task_id": None,
+                    "task_title": None,
+                    "details": {
+                        "added": added_dependencies,
+                        "removed": removed_dependencies,
+                    },
+                })
+            if activity_events and requested_logs:
+                for event in activity_events:
+                    reason = requested_logs.get(str(event.get("task_id") or ""))
+                    if not reason:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO pm_activity_log (
+                            activity_id, project_id, created_at, reason,
+                            event_type, task_id, task_title, details_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self._id("pmactivity"), project_id, now, reason,
+                            event["event_type"], event.get("task_id"),
+                            event.get("task_title"),
+                            json.dumps(event.get("details") or {}, default=str),
+                        ),
+                    )
 
             for assignment in assignments:
                 task_id = str(assignment.get("task_id") or "")
@@ -601,6 +845,153 @@ class PMDatabase:
                     ),
                 )
         return self.get_chart(project_id)
+
+    def list_activity(self, project_id: str) -> list[dict[str, Any]]:
+        self.create_or_migrate()
+        with self.read_connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pm_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if exists is None:
+                raise PMNotFoundError(f"PM project {project_id!r} was not found")
+            rows = self._rows(
+                conn.execute(
+                    """
+                    SELECT * FROM pm_activity_log
+                    WHERE project_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    """,
+                    (project_id,),
+                ).fetchall()
+            )
+            for row in rows:
+                try:
+                    row["details"] = json.loads(row.pop("details_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    row["details"] = {}
+            return rows
+
+    def list_issues(
+        self, project_id: str, task_id: str | None = None,
+        open_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.create_or_migrate()
+        clauses = ["i.project_id = ?"]
+        values: list[Any] = [project_id]
+        if task_id:
+            clauses.append("i.task_id = ?")
+            values.append(task_id)
+        if open_only:
+            clauses.append("i.status NOT IN ('Resolved', 'Closed')")
+        with self.read_connection() as conn:
+            rows = self._rows(conn.execute(
+                f"""
+                SELECT i.*, t.title AS task_title, p.project_number
+                FROM pm_issues i
+                JOIN pm_tasks t ON t.task_id = i.task_id
+                JOIN pm_projects p ON p.project_id = i.project_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY
+                    CASE i.priority
+                        WHEN 'Critical' THEN 1 WHEN 'High' THEN 2
+                        WHEN 'Medium' THEN 3 ELSE 4
+                    END,
+                    COALESCE(i.due_date, '9999-12-31'), i.created_at
+                """,
+                values,
+            ).fetchall())
+            return rows
+
+    def save_issue(
+        self, project_id: str, payload: dict[str, Any],
+        issue_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.create_or_migrate()
+        title = str(payload.get("title") or "").strip()
+        task_id = str(payload.get("task_id") or "").strip()
+        priority = str(payload.get("priority") or "Medium")
+        status = str(payload.get("status") or "Open")
+        if not title:
+            raise PMValidationError("issue title is required")
+        if not task_id:
+            raise PMValidationError("issue task is required")
+        if priority not in {"Low", "Medium", "High", "Critical"}:
+            raise PMValidationError("invalid issue priority")
+        if status not in {"Open", "In Progress", "Blocked", "Resolved", "Closed"}:
+            raise PMValidationError("invalid issue status")
+        resolution = str(payload.get("resolution_note") or "").strip()
+        if status in {"Resolved", "Closed"} and not resolution:
+            raise PMValidationError("a resolution note is required to resolve or close an issue")
+        now = self._now()
+        issue_id = str(issue_id or payload.get("issue_id") or self._id("pmissue"))
+        with self.transaction() as conn:
+            task = conn.execute(
+                "SELECT 1 FROM pm_tasks WHERE task_id = ? AND project_id = ?",
+                (task_id, project_id),
+            ).fetchone()
+            if task is None:
+                raise PMValidationError("issue task must belong to this project")
+            previous_row = conn.execute(
+                "SELECT * FROM pm_issues WHERE issue_id = ? AND project_id = ?",
+                (issue_id, project_id),
+            ).fetchone()
+            previous = dict(previous_row) if previous_row else None
+            values = (
+                title, str(payload.get("description") or ""), priority,
+                str(payload.get("owner") or ""), self._validate_iso_date(
+                    payload.get("due_date"), "issue.due_date"
+                ), status, resolution, now,
+            )
+            if previous:
+                conn.execute(
+                    """
+                    UPDATE pm_issues SET title = ?, description = ?, priority = ?,
+                        owner = ?, due_date = ?, status = ?, resolution_note = ?,
+                        updated_at = ?
+                    WHERE issue_id = ? AND project_id = ?
+                    """,
+                    (*values, issue_id, project_id),
+                )
+                changes = {}
+                fields = (
+                    "title", "description", "priority", "owner", "due_date",
+                    "status", "resolution_note",
+                )
+                for field, after in zip(fields, values[:-1]):
+                    if previous.get(field) != after:
+                        changes[field] = {
+                            "before": previous.get(field), "after": after
+                        }
+                action = "updated"
+                details = {"changes": changes}
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO pm_issues (
+                        issue_id, project_id, task_id, title, description,
+                        priority, owner, due_date, status, resolution_note,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (issue_id, project_id, task_id, *values[:-1], now, now),
+                )
+                action = "created"
+                details = {"title": title, "status": status}
+            conn.execute(
+                """
+                INSERT INTO pm_issue_history (
+                    history_id, issue_id, changed_at, action, details_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    self._id("pmissuehistory"), issue_id, now, action,
+                    json.dumps(details, default=str),
+                ),
+            )
+        return next(
+            issue for issue in self.list_issues(project_id)
+            if issue["issue_id"] == issue_id
+        )
 
     def list_resources(self) -> list[dict[str, Any]]:
         self.create_or_migrate()

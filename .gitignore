@@ -8,3 +8,5 @@ __pycache__/
 *.vccm
 uploads/
 pic/
+server.stdout.log
+server.stderr.log

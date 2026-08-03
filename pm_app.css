@@ -2,37 +2,27 @@
   height: calc(100vh - 2.75rem);
   display: flex;
   flex-direction: column;
-  background: #f4f7f9;
+  background: #fff;
   color: #203446;
   font-family: "72", Arial, sans-serif;
 }
 
 .vtPmToolbar {
-  min-height: 58px;
-  padding: 9px 16px;
+  min-height: 106px;
+  padding: 6px 8px 5px;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  align-content: flex-start;
+  gap: 6px;
   flex-wrap: wrap;
-  background: #fff;
-  border-bottom: 1px solid #dce4ea;
-  box-shadow: 0 2px 7px rgba(31, 61, 82, 0.07);
+  background: #f7f9fb;
+  border-bottom: 1px solid #d9dfe7;
+  box-shadow: none;
 }
 
-.vtPmBrand {
-  margin-right: 12px;
-}
-
-.vtPmBrand strong {
-  display: block;
-  color: #12344d;
-  font-size: 1rem;
-}
-
-.vtPmBrand span {
-  color: #718494;
-  font-size: 0.72rem;
-}
+.vtPmToolGroup { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.vtPmToolGroupTitle { height: 14px; color: #32363a; font-size: .68rem; font-weight: 600; line-height: 14px; }
+.vtPmToolPanel { min-height: 79px; box-sizing: border-box; padding: 3px 4px; background: transparent; border: 1px solid #d9dfe7; display: flex; align-items: center; justify-content: center; }
 
 .vtPmToolbar select,
 .vtPmToolbar input,
@@ -48,15 +38,13 @@
   font: inherit;
 }
 
-.vtPmProjectSelect {
-  min-width: 245px;
-}
+.vtPmProjectSelect { min-width: 220px; }
 
 .vtPmBtn {
-  min-height: 34px;
-  padding: 0 13px;
+  min-height: 26px;
+  padding: 0 8px;
   border: 1px solid #aebfca;
-  border-radius: 5px;
+  border-radius: 2px;
   background: #fff;
   color: #23445c;
   cursor: pointer;
@@ -64,28 +52,17 @@
 }
 
 .vtPmBtn:hover { background: #edf5fb; border-color: #0a6ed1; }
+.vtPmBtnAccept { color: #107e3e; border-color: #107e3e; }
+.vtPmBtnReject { color: #bb0000; border-color: #bb0000; }
 .vtPmBtnPrimary { background: #0a6ed1; border-color: #0a6ed1; color: #fff; }
 .vtPmBtnPrimary:hover { background: #085caf; color: #fff; }
 .vtPmBtnSuccess { background: #107e3e; border-color: #107e3e; color: #fff; }
 .vtPmBtnSuccess:hover { background: #0b6b34; color: #fff; }
 .vtPmBtnDanger { color: #bb0000; }
 .vtPmToolbarSpacer { flex: 1 1 auto; }
-.vtPmStructureTools {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 7px;
-  border: 1px solid #d3dee5;
-  border-radius: 6px;
-  background: #f7fafc;
-}
-.vtPmStructureLabel {
-  color: #5f7484;
-  font-size: 0.68rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
+.vtPmStructurePanel { width: 270px; flex-direction: column; gap: 2px; }
+.vtPmStructurePanel > div { display: flex; gap: 2px; }
+.vtPmStructurePanel .vtPmBtn { min-width: 125px; }
 .vtPmQuantity {
   width: 58px;
   min-width: 58px;
@@ -94,8 +71,10 @@
 
 .vtPmStatus {
   display: none;
-  padding: 8px 16px;
-  border-bottom: 1px solid transparent;
+  min-height: 28px;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border-top: 1px solid #d9d9d9;
   font-size: 0.78rem;
 }
 
@@ -135,40 +114,92 @@
 
 .vtPmBoard.show { display: flex; }
 
-.vtPmSummary {
-  padding: 8px 16px;
+.vtPmScaleToolbar {
+  min-height: 32px;
+  padding: 0 8px;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 6px;
   flex-wrap: wrap;
-  background: #eef5fa;
-  border-bottom: 1px solid #d7e3ec;
-  font-size: 0.78rem;
-  color: #48657a;
+  background: #fff;
+  border-bottom: 1px solid #d9d9d9;
+  font-size: .75rem;
+  color: #32363a;
 }
 
-.vtPmSummary strong { color: #12344d; }
+.vtPmScaleToolbar input[type="range"] { width: 180px; accent-color: #0854a0; }
+.vtPmScaleToolbar strong { min-width: 62px; }
+.vtPmScaleMode {
+  min-width: 60px;
+  color: #0854a0;
+  font-weight: 600;
+}
+.vtPmScaleSeparator { height: 20px; border-left: 1px solid #d9d9d9; margin: 0 2px; }
+.vtPmScaleBtn { width: 28px; height: 28px; border: 0; background: transparent; color: #0854a0; font-size: 1.1rem; }
+.vtPmScaleBtn:hover { background: #e8f1f8; }
+.vtPmProjectCaption { margin-left: auto; color: #5f6b73; font-style: italic; }
+.vtPmMonthSelector { display: flex; align-items: center; gap: 5px; margin-left: 5px; font-weight: 600; }
+.vtPmMonthSelector select { height: 26px; min-width: 145px; border: 1px solid #aab9c3; background: #fff; color: #32363a; }
 
 .vtPmGridWrap {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 0;
+  background: #fff;
 }
+.vtPmHorizontalScroll {
+  flex: 0 0 18px;
+  height: 18px;
+  overflow-x: scroll;
+  overflow-y: hidden;
+  border-top: 1px solid #d9dfe7;
+  background: #f7f9fb;
+}
+.vtPmHorizontalScrollTrack { height: 1px; }
+.vtPmSchedulePanel { gap: 4px; }
+.vtPmPhaseButton {
+  width: 94px;
+  height: 68px;
+  padding: 4px;
+  border: 1px solid #d9dfe7;
+  background: #fff;
+  color: #32363a;
+  cursor: pointer;
+}
+.vtPmPhaseButton:hover { border-color: #0854a0; background: #edf6fc; }
+.vtPmPhaseButton strong { display: block; color: #0854a0; font-size: .74rem; }
+.vtPmPhaseButton span { display: block; margin-top: 14px; font-size: .64rem; }
+.vtPmCommandPanel { gap: 2px; }
+.vtPmIconCommand { width: 52px; height: 68px; border: 0; background: transparent; color: #0854a0; font: 1.25rem "72", Arial, sans-serif; cursor: pointer; }
+.vtPmIconCommand:hover:not(:disabled) { background: #e8f1f8; }
+.vtPmIconCommand:disabled { color: #7d8b96; opacity: .65; }
+.vtPmIconCommand small { display: block; margin-top: 7px; color: #32363a; font-size: .62rem; white-space: nowrap; }
+.vtPmProjectPanel { width: 235px; flex-direction: column; gap: 6px; }
+.vtPmProjectPanel > div { display: flex; gap: 4px; }
 
 .vtPmGrid {
-  min-width: 1180px;
+  min-width: 1240px;
   background: #fff;
-  border: 1px solid #d9e2e8;
-  border-radius: 7px;
+  border: 0;
   overflow: hidden;
 }
 
 .vtPmGridHeader,
 .vtPmTaskRow {
   display: grid;
-  grid-template-columns: 42px 280px 120px 90px 105px 115px 175px minmax(430px, 1fr);
-  min-height: 42px;
+  grid-template-columns:
+    var(--pm-index-width, 42px)
+    var(--pm-title-width, 220px)
+    var(--pm-timeline-width, 430px)
+    var(--pm-start-width, 105px)
+    var(--pm-duration-width, 110px)
+    var(--pm-finish-width, 105px)
+    var(--pm-progress-width, 110px)
+    var(--pm-issues-width, 82px)
+    var(--pm-resource-width, 165px);
+  min-height: 36px;
   align-items: stretch;
 }
 
@@ -176,18 +207,26 @@
   position: sticky;
   top: 0;
   z-index: 4;
-  min-height: 45px;
+  min-height: 32px;
   color: #3c5364;
-  background: #edf2f5;
+  background: #f3f6f9;
   border-bottom: 1px solid #cdd9e1;
   font-size: 0.74rem;
   font-weight: 700;
+}
+.vtPmGridHeader.vtPmVerticalDates { min-height: 58px; }
+.vtPmVerticalDates .vtPmGanttDay {
+  padding: 4px 1px;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  line-height: 1;
+  text-align: left;
 }
 
 .vtPmCell {
   box-sizing: border-box;
   min-width: 0;
-  padding: 7px 8px;
+  padding: 5px 8px;
   display: flex;
   align-items: center;
   border-right: 1px solid #e6ecef;
@@ -195,7 +234,7 @@
 
 .vtPmTaskRow {
   position: relative;
-  min-height: 46px;
+  min-height: 36px;
   border-bottom: 1px solid #edf1f3;
   font-size: 0.78rem;
 }
@@ -203,29 +242,87 @@
 .vtPmTaskRow:hover { background: #f8fbfd; }
 .vtPmTaskRow.vtPmConflict { background: #fff7df; }
 .vtPmTaskRow.vtPmSelected {
-  background: #e7f2fb;
-  box-shadow: inset 4px 0 0 #0a6ed1;
+  background: #d1e8ff;
+  box-shadow: inset 3px 0 0 #0854a0;
 }
 .vtPmTaskRow.vtPmSelected.vtPmConflict {
   background: #fff0bd;
 }
+.vtPmGridHeader .vtPmCell { position: relative; }
+.vtPmColumnResizer {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+}
+.vtPmColumnResizer:hover { background: rgba(8, 84, 160, .28); }
+body.vtPmResizingColumn { cursor: col-resize !important; user-select: none !important; }
+.vtPmTaskRow.vtPmConditionSource {
+  background: #fff3cd;
+  box-shadow: inset 3px 0 0 #e9730c;
+}
+.vtPmTaskRow.vtPmConditionValue {
+  background: #e5f4ea;
+  box-shadow: inset 3px 0 0 #107e3e;
+}
+.vtPmWorkspace:has(.vtPmConditionSource) .vtPmTaskRow:not(.vtPmConditionSource) {
+  cursor: crosshair;
+}
 .vtPmIndex { justify-content: center; color: #82929e; }
 .vtPmTaskTitle { font-weight: 600; color: #203f56; }
+.vtPmTreeToggle,
+.vtPmTreeToggleSpacer {
+  width: 18px;
+  min-width: 18px;
+  height: 24px;
+  margin-right: 2px;
+  padding: 0;
+}
+.vtPmTreeToggle {
+  border: 0;
+  background: transparent;
+  color: #4f6473;
+  cursor: pointer;
+  font-size: .82rem;
+}
+.vtPmTreeToggle:hover { color: #0854a0; background: #e8f1f8; }
 .vtPmTaskTitle[data-depth="1"] { padding-left: 24px; }
 .vtPmTaskTitle[data-depth="2"] { padding-left: 42px; }
+.vtPmTaskTitle[data-depth="3"] { padding-left: 60px; }
+.vtPmTaskTitle[data-depth="4"] { padding-left: 78px; }
+.vtPmTaskTitle[data-depth="5"] { padding-left: 96px; }
+.vtPmTaskTitle[data-depth="6"],
+.vtPmTaskTitle[data-depth="7"] { padding-left: 114px; }
+.vtPmTaskTitleText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.vtPmTitleLevel1 { color: brown; font-weight: 700; font-style: normal; text-transform: uppercase; }
+.vtPmTitleLevel2 { color: #193CB8; font-weight: 700; font-style: normal; }
+.vtPmTitleLevel3 { color: #1447E6; font-weight: 400; font-style: italic; }
+.vtPmTitleLevel4 { color: #098A81; font-weight: 400; font-style: italic; }
+.vtPmTitleLevel5 { color: #8A0912; font-weight: 400; font-style: italic; }
+.vtPmTitleLevel6 { color: #8A8109; font-weight: 400; font-style: italic; }
+.vtPmTitleLevel7 { color: #4A5565; font-weight: 400; font-style: italic; }
+.vtPmTitleLevel8 { color: #9F9FA9; font-weight: 400; font-style: italic; }
+.vtPmTaskTitleText.vtPmCopiedTitle { color: #bb0000; }
 .vtPmMuted { color: #7a8c99; }
 
-.vtPmProgressTrack {
-  position: relative;
-  width: 100%;
-  height: 10px;
-  overflow: hidden;
-  border-radius: 6px;
-  background: #e2e9ed;
+.vtPmMilestoneIcon {
+  width: 9px;
+  height: 9px;
+  margin-right: 7px;
+  flex: 0 0 auto;
+  background: #0a6ed1;
+  transform: rotate(45deg);
 }
-
-.vtPmProgressFill { height: 100%; background: #107e3e; }
-.vtPmProgressText { margin-left: 6px; min-width: 31px; font-size: 0.7rem; }
 
 .vtPmGanttHead,
 .vtPmGanttCell {
@@ -236,6 +333,35 @@
 }
 
 .vtPmGanttHead { background-color: #f4f7f9; }
+.vtPmParentEndGuide {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed #9aa5ad;
+  pointer-events: none;
+}
+.vtPmTodayLine {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid rgba(187, 0, 0, .72);
+  pointer-events: none;
+}
+.vtPmTodayLineHeader em {
+  position: absolute;
+  top: 2px;
+  left: 3px;
+  padding: 1px 3px;
+  background: #bb0000;
+  color: #fff;
+  font-size: .58rem;
+  font-style: normal;
+  line-height: 1.2;
+}
 .vtPmGanttAxis {
   position: absolute;
   inset: 0;
@@ -255,34 +381,236 @@
 
 .vtPmGanttDay.weekend { background: rgba(125, 140, 150, 0.08); color: #97a4ad; }
 
+.vtPmGanttPeriod {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  height: 100%;
+  padding: 4px 6px;
+  overflow: hidden;
+  border-right: 1px solid #b8c5ce;
+  color: #4c6373;
+  text-align: center;
+  white-space: nowrap;
+  font-size: .68rem;
+  font-weight: 600;
+}
+.vtPmGanttPeriod strong { margin-right: 5px; color: #27475e; }
+.vtPmGanttPeriod span { color: #738795; font-weight: 400; }
+.vtPmGanttMonth {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #eef3f6;
+  color: #27475e;
+  font-size: .74rem;
+}
+.vtPmGanttYear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #e5edf2;
+  color: #193f59;
+  font-size: .76rem;
+  font-weight: 700;
+}
+.vtPmTimeScaleSelector {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.vtPmTimeScaleSelector select { min-width: 78px; }
+.vtPmScale-week {
+  background-size: calc(var(--vt-pm-day-width, 34px) * 7) 100%;
+}
+
 .vtPmBar {
   position: absolute;
-  top: 11px;
-  height: 23px;
+  z-index: 2;
+  top: 12px;
+  height: 12px;
   min-width: 5px;
-  overflow: hidden;
-  border-radius: 4px;
-  background: #0a6ed1;
+  overflow: visible;
+  border-radius: 0;
+  background: var(--vt-pm-bar-color, #0a6ed1);
   box-shadow: inset 0 0 0 1px rgba(0, 43, 79, 0.18);
   color: #fff;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 0.68rem;
-  line-height: 23px;
-  padding: 0 7px;
+  font-size: 0;
+  line-height: 12px;
+  padding: 0;
   box-sizing: border-box;
 }
 
-.vtPmBarProgress {
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: rgba(16, 126, 62, 0.68);
+.vtPmParentBar {
+  top: 10px;
+  height: 16px;
+  overflow: visible;
+  background: transparent;
+  border-top: 2px dashed var(--vt-pm-bar-color, #0a6ed1);
+  border-right: 2px dashed var(--vt-pm-bar-color, #0a6ed1);
+  border-left: 2px dashed var(--vt-pm-bar-color, #0a6ed1);
+  border-bottom: 0;
+  box-shadow: none;
 }
 
-.vtPmBarLabel { position: relative; z-index: 1; }
-.vtPmRowActions { margin-left: auto; display: flex; gap: 2px; }
-.vtPmIconBtn { border: 0; background: transparent; color: #587184; cursor: pointer; padding: 4px; }
-.vtPmIconBtn:hover { color: #0a6ed1; }
+.vtPmBarProgressLabel {
+  position: absolute;
+  z-index: 3;
+  left: calc(100% + var(--vt-pm-label-offset, 5px));
+  top: 50%;
+  transform: translateY(-50%);
+  color: #27475e;
+  font-size: .61rem;
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: none;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.vtPmBarProgressLabel.vtPmBarComplete {
+  top: 50%;
+  left: calc(100% + var(--vt-pm-label-offset, 5px));
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #107e3e;
+  color: #fff;
+  font-size: .72rem;
+  line-height: 14px;
+  text-align: center;
+  text-shadow: none;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .9);
+}
+.vtPmParentBar .vtPmBarProgressLabel {
+  color: #27475e;
+  text-shadow: none;
+}
+.vtPmParentBar .vtPmBarProgressLabel.vtPmBarComplete {
+  color: #fff;
+}
+#vtPmTaskTooltip {
+  position: fixed;
+  z-index: 10050;
+  display: none;
+  width: max-content;
+  min-width: 220px;
+  max-width: 370px;
+  pointer-events: none;
+  font-size: 12px;
+  line-height: 1.55;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, .24));
+}
+.vtPmTooltipCard {
+  overflow: hidden;
+  border: 1px solid #107e3e;
+  border-radius: 8px;
+  background: #fff;
+  color: #0854a0;
+}
+.vtPmTooltipHeader {
+  padding: 5px 9px;
+  background: #0854a0;
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+.vtPmTooltipBody { padding: 8px 10px; }
+.vtPmTooltipBody > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+}
+.vtPmTooltipBody em {
+  color: #107e3e;
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.vtPmTooltipDivider {
+  display: block !important;
+  margin: 7px 0 5px;
+  border-top: 1px solid #d9e5dc;
+}
+.vtPmTooltipCondition { margin-top: 3px; }
+.vtPmProgressCell { gap: 6px; }
+.vtPmProgressTrack {
+  position: relative;
+  flex: 1 1 auto;
+  height: 9px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: #dfe6ea;
+}
+.vtPmProgressFill { display: block; height: 100%; background: #107e3e; }
+.vtPmProgressCell strong { min-width: 30px; font-size: .68rem; color: #435b6b; }
+.vtPmIssueCell { justify-content: center; }
+.vtPmIssueCell { gap: 4px; }
+.vtPmIssueCount {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: #fff3cd;
+  border: 1px solid #e7c65c;
+  color: #8d5f00;
+  font-size: .68rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.vtPmIssueCount:hover { background: #ffe9a3; border-color: #c99b00; }
+.vtPmIssueResolvedCount {
+  background: #e8f4ea;
+  border-color: #9cc8a6;
+  color: #256f3a;
+}
+.vtPmIssueResolvedCount:hover { background: #d4edda; border-color: #5da96d; }
+.vtPmTaskRow.vtPmOverdue { background-color: #fff4f3; }
+.vtPmTaskRow.vtPmOverdue .vtPmBar:not(.vtPmParentBar) {
+  box-shadow: inset 0 0 0 2px #bb0000, 0 0 0 1px rgba(187, 0, 0, .18);
+}
+.vtPmOverdueFinish { color: #a50000; font-weight: 700; gap: 5px; }
+.vtPmOverdueBadge {
+  padding: 1px 4px;
+  border-radius: 2px;
+  background: #bb0000;
+  color: #fff;
+  font-size: .58rem;
+  font-weight: 700;
+}
+.vtPmOverdueIcon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #bb0000;
+  color: #fff;
+  text-align: center;
+  font-size: .64rem;
+  font-weight: 700;
+  line-height: 14px;
+}
+
+.vtPmWeekendBarSegment {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(255, 255, 255, .72) 0,
+      rgba(255, 255, 255, .72) 2px,
+      rgba(0, 0, 0, .18) 2px,
+      rgba(0, 0, 0, .18) 4px
+    );
+  box-shadow:
+    inset 1px 0 rgba(255, 255, 255, .38),
+    inset -1px 0 rgba(0, 0, 0, .12);
+  pointer-events: none;
+}
+.vtPmWeekendContinuation {
+  background-color: var(--vt-pm-bar-color, #0a6ed1);
+}
 
 .vtPmModalBackdrop {
   position: fixed;
@@ -322,8 +650,128 @@
 .vtPmField { display: flex; flex-direction: column; gap: 5px; }
 .vtPmFieldFull { grid-column: 1 / -1; }
 .vtPmField label { color: #536b7d; font-size: 0.72rem; font-weight: 700; }
+.vtPmReadOnlyField {
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid #d9dfe7;
+  background: #f7f9fb;
+  color: #32363a;
+  font-size: .74rem;
+}
+.vtPmReadOnlyField small { display: block; margin-top: 4px; color: #6a7780; }
+.vtPmScheduleSummaryRow {
+  display: grid;
+  grid-template-columns: minmax(82px, auto) 1fr;
+  gap: 6px;
+  padding: 2px 0;
+  line-height: 1.35;
+}
+.vtPmScheduleSummaryRow strong { color: #29485d; }
 .vtPmField input,
 .vtPmField select { width: 100%; }
+.vtPmReasonInput {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid #8996a0;
+  border-radius: 3px;
+  font: inherit;
+}
+.vtPmFieldHint { color: #637784; font-size: .7rem; }
+.vtPmValidationMessage { min-height: 16px; color: #bb0000; font-size: .72rem; font-weight: 700; }
+.vtPmLogChangeBox {
+  margin-top: 3px;
+  padding: 11px 12px;
+  border: 1px solid #d7e1e8;
+  border-radius: 4px;
+  background: #f7f9fa;
+}
+.vtPmCheckboxLabel {
+  display: flex;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+  color: #243f51 !important;
+  cursor: pointer;
+}
+.vtPmCheckboxLabel input { width: auto; margin: 0; }
+#pmTaskLogReasonWrap { margin-top: 10px; }
+#pmTaskLogReasonWrap[hidden] { display: none; }
+#pmTaskLogReasonWrap > label { display: block; margin-bottom: 5px; }
+.vtPmDialogTabs { display: flex; gap: 0; border-bottom: 1px solid #cdd8df; }
+.vtPmDialogTabs button {
+  padding: 9px 16px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
+  color: #526b7c;
+  font-weight: 700;
+  cursor: pointer;
+}
+.vtPmDialogTabs button.active { border-bottom-color: #0a6ed1; color: #0a6ed1; }
+.vtPmDialogTabs button:disabled { color: #9ca9b1; cursor: default; }
+.vtPmTaskTabPanel { display: none; }
+.vtPmTaskTabPanel.active { display: block; }
+.vtPmTaskDetailsGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+.vtPmIssuePanelHeader, .vtPmIssueRegisterActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.vtPmTaskIssueList { display: flex; flex-direction: column; gap: 7px; }
+.vtPmIssueCard {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d8e1e7;
+  border-radius: 4px;
+  background: #fff;
+  color: #526b7c;
+  text-align: left;
+  cursor: pointer;
+}
+.vtPmIssueCard:hover { border-color: #0a6ed1; background: #f5faff; }
+.vtPmIssueCardTop { display: flex; justify-content: space-between; gap: 12px; color: #203b4d; }
+.vtPmIssuePriority { padding: 2px 7px; border-radius: 10px; font-size: .66rem; font-style: normal; font-weight: 700; }
+.vtPmIssuePriorityLow { background: #e8f4ea; color: #256f3a; }
+.vtPmIssuePriorityMedium { background: #e5f0fa; color: #075caf; }
+.vtPmIssuePriorityHigh { background: #fff3cd; color: #8d5f00; }
+.vtPmIssuePriorityCritical { background: #ffe7e7; color: #aa0808; }
+.vtPmIssueEmpty { padding: 24px; color: #647986; text-align: center; }
+.vtPmIssuesDialog { width: min(980px, calc(100vw - 32px)); }
+.vtPmProjectIssueHeader, .vtPmProjectIssueRow {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) 90px minmax(110px, 1fr) 100px 110px;
+  gap: 10px;
+  align-items: center;
+}
+.vtPmProjectIssueHeader {
+  padding: 7px 10px;
+  background: #edf2f5;
+  color: #526b7c;
+  font-size: .68rem;
+  font-weight: 700;
+}
+.vtPmProjectIssueList { max-height: 55vh; overflow: auto; }
+.vtPmProjectIssueRow {
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-bottom: 1px solid #e3e8eb;
+  background: #fff;
+  color: #405969;
+  text-align: left;
+  cursor: pointer;
+}
+.vtPmProjectIssueRow:hover { background: #f3f8fc; }
+.vtPmProjectIssueRow > span:first-child { display: flex; flex-direction: column; gap: 3px; }
+.vtPmProjectIssueRow small { color: #738591; }
 .vtPmDialogFooter {
   padding: 12px 18px;
   display: flex;
@@ -333,10 +781,44 @@
 }
 
 .vtPmConflictList { margin: 0; padding-left: 20px; color: #5d4c15; line-height: 1.55; }
+.vtPmHistoryDialog { width: min(820px, calc(100vw - 32px)); }
+.vtPmActivityList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: min(65vh, 680px);
+  overflow: auto;
+}
+.vtPmActivityItem {
+  padding: 12px 14px;
+  border: 1px solid #dce3e8;
+  border-left: 4px solid #0a6ed1;
+  border-radius: 4px;
+  background: #fafbfc;
+}
+.vtPmActivityMeta { display: flex; justify-content: space-between; gap: 12px; color: #647986; font-size: .68rem; }
+.vtPmActivityMeta span { text-transform: capitalize; font-weight: 700; }
+.vtPmActivityItem h4 { margin: 6px 0 4px; color: #203b4d; font-size: .82rem; }
+.vtPmActivityReason { margin: 0 0 8px; color: #263f50; font-size: .78rem; font-style: italic; }
+.vtPmActivityDetails { color: #536b7d; font-size: .72rem; }
+.vtPmActivityChange {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(90px, 1.2fr) auto minmax(90px, 1.2fr);
+  gap: 8px;
+  align-items: start;
+  padding: 3px 0;
+  border-top: 1px solid #edf0f2;
+}
+.vtPmActivityChange strong { text-transform: capitalize; }
+.vtPmActivityChange b { color: #0a6ed1; }
+.vtPmActivityEmpty { padding: 28px; text-align: center; color: #647986; }
 
 @media (max-width: 760px) {
   .vtPmToolbar { align-items: stretch; }
   .vtPmProjectSelect { flex: 1 1 100%; }
   .vtPmDialogBody { grid-template-columns: 1fr; }
   .vtPmFieldFull { grid-column: auto; }
+  .vtPmTaskDetailsGrid { grid-template-columns: 1fr; }
+  .vtPmProjectIssueHeader { display: none; }
+  .vtPmProjectIssueRow { grid-template-columns: 1fr 80px; }
 }

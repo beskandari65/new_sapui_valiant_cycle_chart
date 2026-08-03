@@ -169,9 +169,13 @@ def _make_excel_report(proj_num, proj_title, target_ct, ops_data):
     return out
 
 # ── Real DB configuration (optional) ──────────────────────────────────────────
-# Set DB_PATH to your .db or .sqlite file to use a real database.
-# Leave as None to use the embedded sample data below.
-DB_PATH    = os.environ.get("DB_PATH") or None  # e.g. r"C:\path\to\your\chart.db"
+# Set DB_PATH to override the project-local SQLite database.
+# A persistent default is important because the UI's Save action promises that
+# jobs are written to a database; silently falling back to process memory makes
+# newly-created jobs disappear after the server restarts.
+DB_PATH    = os.environ.get("DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cycle_chart.db"
+)
 TABLE_NAME = os.environ.get("TABLE_NAME", "cycle_general_structure")
 
 # PM uses separate domain tables in the same SQLite database.  Registering the
@@ -1078,12 +1082,59 @@ _ITEMS_DETAILS_SCHEMA = """
 """
 
 
+_CYCLE_GENERAL_STRUCTURE_SCHEMA = f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        id                  INTEGER,
+        item_id             TEXT PRIMARY KEY,
+        parent_id           TEXT DEFAULT '',
+        project_number      TEXT DEFAULT '',
+        op_number           TEXT DEFAULT '',
+        title               TEXT DEFAULT '',
+        cycle_start         REAL DEFAULT 0.0,
+        cycle_end           REAL DEFAULT 0.0,
+        cycle_time          REAL DEFAULT 0.0,
+        cycle_type          TEXT DEFAULT '',
+        color               TEXT DEFAULT '',
+        subprocess          TEXT DEFAULT '',
+        tree_index          INTEGER DEFAULT 0,
+        step                TEXT DEFAULT '',
+        highlight           TEXT DEFAULT '',
+        dependant_items     TEXT DEFAULT '{{}}',
+        run_cond_config     TEXT DEFAULT '{{}}'
+    )
+"""
+
+
 def _ensure_project_metadata_table(conn):
     conn.execute(_PROJECT_METADATA_SCHEMA)
 
 
 def _ensure_items_details_table(conn):
     conn.execute(_ITEMS_DETAILS_SCHEMA)
+
+
+def _initialize_database():
+    """Create the persistent local database and seed it on first launch."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(_CYCLE_GENERAL_STRUCTURE_SCHEMA)
+        _ensure_project_metadata_table(conn)
+        _ensure_items_details_table(conn)
+
+        row_count = conn.execute(
+            f"SELECT COUNT(*) FROM {TABLE_NAME}"
+        ).fetchone()[0]
+        if row_count == 0 and SAMPLE_DATA:
+            columns = list(SAMPLE_DATA[0])
+            placeholders = ",".join("?" for _ in columns)
+            conn.executemany(
+                f"INSERT INTO {TABLE_NAME} ({','.join(columns)}) "
+                f"VALUES ({placeholders})",
+                [[record.get(column) for column in columns] for record in SAMPLE_DATA],
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ensure_project_number_col(conn):
@@ -1102,6 +1153,10 @@ def _ensure_project_number_col(conn):
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE items_details ADD COLUMN {col} {defn}")
+    conn.commit()
+
+
+_initialize_database()
 
 
 @app.route("/api/items_details/<op_number>", methods=["GET"])

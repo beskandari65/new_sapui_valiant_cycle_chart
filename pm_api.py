@@ -76,6 +76,29 @@ def create_pm_blueprint(
             "warnings": warnings,
         })
 
+    @blueprint.get("/projects/<project_id>/activity")
+    def get_project_activity(project_id):
+        return jsonify(database().list_activity(project_id))
+
+    @blueprint.get("/projects/<project_id>/issues")
+    def get_project_issues(project_id):
+        task_id = request.args.get("task_id")
+        open_only = request.args.get("open_only", "").lower() in {"1", "true", "yes"}
+        return jsonify(database().list_issues(project_id, task_id, open_only))
+
+    @blueprint.post("/projects/<project_id>/issues")
+    def create_project_issue(project_id):
+        issue = database().save_issue(
+            project_id, request.get_json(silent=True) or {}
+        )
+        return jsonify(issue), 201
+
+    @blueprint.put("/projects/<project_id>/issues/<issue_id>")
+    def update_project_issue(project_id, issue_id):
+        return jsonify(database().save_issue(
+            project_id, request.get_json(silent=True) or {}, issue_id
+        ))
+
     @blueprint.get("/resources")
     def list_resources():
         return jsonify(database().list_resources())
