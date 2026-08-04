@@ -450,6 +450,24 @@ class PMDatabase:
                     (project_id,),
                 ).fetchall()
             )
+            calendar_id = project["calendar_id"] or "pm_default"
+            calendar_weekdays = self._rows(conn.execute(
+                """
+                SELECT weekday, is_working, start_time, end_time
+                FROM pm_calendar_weekdays WHERE calendar_id = ?
+                ORDER BY weekday
+                """,
+                (calendar_id,),
+            ).fetchall())
+            calendar_exceptions = self._rows(conn.execute(
+                """
+                SELECT exception_date, is_working, start_time, end_time,
+                       description
+                FROM pm_calendar_exceptions WHERE calendar_id = ?
+                ORDER BY exception_date
+                """,
+                (calendar_id,),
+            ).fetchall())
             return {
                 "mode": "project_management",
                 "project": dict(project),
@@ -457,6 +475,11 @@ class PMDatabase:
                 "dependencies": dependencies,
                 "assignments": assignments,
                 "deliverables": deliverables,
+                "calendar": {
+                    "calendar_id": calendar_id,
+                    "weekdays": calendar_weekdays,
+                    "exceptions": calendar_exceptions,
+                },
                 "ui": {
                     "itemTitleField": "title",
                     "showStep": False,

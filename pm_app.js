@@ -12,6 +12,7 @@
     conflicts: [],
     issues: [],
     pendingIssueChanges: {},
+    saveInProgress: false,
     dirty: false,
     selectedTaskId: "",
     selectedTaskIds: [],
@@ -298,7 +299,7 @@
             '<button class="vtPmIconCommand" disabled>⇤<small>Hierarchy</small></button><button class="vtPmIconCommand" disabled>↕<small>Order</small></button>',
           '</div></div>',
           '<div class="vtPmToolGroup"><div class="vtPmToolGroupTitle">Tools</div><div class="vtPmToolPanel vtPmCommandPanel">',
-            '<button class="vtPmIconCommand" data-action="edit-selected">▦<small>More Spec</small></button><button class="vtPmIconCommand" data-action="new-resource">♟<small>Resources</small></button><button class="vtPmIconCommand" data-action="check-conflicts">⚠<small>Check</small></button><button class="vtPmIconCommand" data-action="history">◷<small>History</small></button><button class="vtPmIconCommand" data-action="issues">⚑<small>Open Issues</small></button>',
+            '<button class="vtPmIconCommand" data-action="edit-selected">▦<small>More Spec</small></button><button class="vtPmIconCommand" data-action="new-resource">♟<small>Resources</small></button><button class="vtPmIconCommand" data-action="check-conflicts">⚠<small>Check</small></button><button class="vtPmIconCommand" data-action="history">◷<small>History</small></button><button class="vtPmIconCommand" data-action="issues">⚑<small>Issues</small></button><button class="vtPmIconCommand" data-action="reports">▤<small>Reports</small></button>',
           '</div></div>',
           '<div class="vtPmToolGroup vtPmProjectGroup"><div class="vtPmToolGroupTitle">Project</div><div class="vtPmToolPanel vtPmProjectPanel">',
             '<select id="vtPmProjectSelect" class="vtPmProjectSelect" aria-label="PM project">', projectOptions(), '</select>',
@@ -384,6 +385,22 @@
       parent = map[parent].parent_id;
     }
     return depth;
+  }
+
+  function isChartWorkingDay(date) {
+    if (!date) return false;
+    var calendar = state.chart && state.chart.calendar || {};
+    var dateValue = isoDate(date);
+    var exception = (calendar.exceptions || []).find(function (item) {
+      return item.exception_date === dateValue;
+    });
+    if (exception) return !!Number(exception.is_working);
+    var databaseWeekday = (date.getUTCDay() + 6) % 7;
+    var weekday = (calendar.weekdays || []).find(function (item) {
+      return Number(item.weekday) === databaseWeekday;
+    });
+    if (weekday) return !!Number(weekday.is_working);
+    return date.getUTCDay() !== 0 && date.getUTCDay() !== 6;
   }
 
   function chartBounds(tasks) {
@@ -673,11 +690,19 @@
             : 0;
           var weekendSegments = [];
           var weekendContinuationDays = 0;
+          if (start && parentIds[task.task_id] &&
+              scheduleConfig(task).start_from_parent &&
+              !isChartWorkingDay(start)) {
+            weekendSegments.push(
+              '<span class="vtPmWeekendBarSegment" style="left:0;width:' +
+              state.dayWidth + 'px"></span>'
+            );
+          }
           if (start && end && !parentIds[task.task_id]) {
             for (var barDay = new Date(start.getTime()), dayIndex = 0;
                  barDay <= end;
                  barDay = addCalendarDays(barDay, 1), dayIndex++) {
-              if (barDay.getUTCDay() === 0 || barDay.getUTCDay() === 6) {
+              if (!isChartWorkingDay(barDay)) {
                 weekendSegments.push(
                   '<span class="vtPmWeekendBarSegment" style="left:' +
                   (dayIndex * state.dayWidth) + 'px;width:' + state.dayWidth + 'px"></span>'
@@ -695,7 +720,7 @@
               for (var gapDay = addCalendarDays(end, 1), gapIndex = 0;
                    gapDay < nearestSuccessorStart;
                    gapDay = addCalendarDays(gapDay, 1), gapIndex++) {
-                if (gapDay.getUTCDay() === 0 || gapDay.getUTCDay() === 6) {
+                if (!isChartWorkingDay(gapDay)) {
                   weekendContinuationDays = Math.max(weekendContinuationDays, gapIndex + 1);
                   weekendSegments.push(
                     '<span class="vtPmWeekendBarSegment vtPmWeekendContinuation" style="left:' +
@@ -932,6 +957,42 @@
   function hideTaskTooltip() {
     var tooltip = document.getElementById("vtPmTaskTooltip");
     if (tooltip) tooltip.style.display = "none";
+  }
+
+  function openSaveProgress(totalSteps) {
+    var project = state.chart && state.chart.project || {};
+    var wrapper = document.createElement("div");
+    wrapper.className = "vtPmModalBackdrop vtPmSaveBackdrop";
+    wrapper.innerHTML = [
+      '<div class="vtPmSaveDialog" role="dialog" aria-modal="true" aria-live="polite">',
+        '<div class="vtPmSaveHeader">Saving Project # ', escapeHtml(project.project_number || "—"), "</div>",
+        '<div class="vtPmSaveBody">',
+          '<h3 data-save-stage>Preparing project data</h3>',
+          '<p>Saving is in progress. Please do not close or refresh this page.</p>',
+          '<div class="vtPmSaveProgressTrack"><span data-save-progress></span></div>',
+          '<strong data-save-value>0% (0 / ', totalSteps, ")</strong>",
+          '<span class="vtPmSaveSpinner" aria-hidden="true"></span>',
+        "</div>",
+      "</div>"
+    ].join("");
+    document.body.appendChild(wrapper);
+    return {
+      update: function (completed, stage) {
+        var percent = Math.min(100, Math.round((completed / totalSteps) * 100));
+        wrapper.querySelector("[data-save-stage]").textContent = stage;
+        wrapper.querySelector("[data-save-progress]").style.width = percent + "%";
+        wrapper.querySelector("[data-save-value]").textContent =
+          percent + "% (" + completed + " / " + totalSteps + ")";
+        wrapper.classList.toggle("complete", percent >= 100);
+      },
+      fail: function (message) {
+        wrapper.classList.add("failed");
+        wrapper.querySelector("[data-save-stage]").textContent = message || "Save failed";
+      },
+      close: function (delay) {
+        setTimeout(function () { wrapper.remove(); }, delay || 0);
+      }
+    };
   }
 
   function openProjectDialog() {
@@ -2006,6 +2067,11 @@
 
   function performChartSave() {
     if (!state.chart || !state.projectId) return Promise.resolve();
+    if (state.saveInProgress) {
+      setStatus("Saving is already in progress. Please wait.", "warning");
+      return Promise.resolve(null);
+    }
+    state.saveInProgress = true;
     recalculateSchedule();
     state.chart.tasks.forEach(function (task, index) {
       task.tree_index = index;
@@ -2013,6 +2079,10 @@
     });
     setStatus("Saving project...", "info");
     var pendingIssueIds = Object.keys(state.pendingIssueChanges);
+    var totalSaveSteps = 1 + pendingIssueIds.length;
+    var completedSaveSteps = 0;
+    var saveProgress = openSaveProgress(totalSaveSteps);
+    saveProgress.update(0, "Saving chart data");
     return request("/projects/" + encodeURIComponent(state.projectId) + "/chart", {
       method: "PUT",
       body: JSON.stringify({
@@ -2027,6 +2097,11 @@
       })
     }).then(function (chart) {
       state.chart = chart;
+      completedSaveSteps++;
+      saveProgress.update(
+        completedSaveSteps,
+        pendingIssueIds.length ? "Saving project issues" : "Finalizing project"
+      );
       return Promise.all(pendingIssueIds.map(function (issueId) {
         var issue = state.pendingIssueChanges[issueId];
         var path = "/projects/" + encodeURIComponent(state.projectId) + "/issues";
@@ -2034,6 +2109,13 @@
         return request(path, {
           method: issue._pendingNew ? "POST" : "PUT",
           body: JSON.stringify(issue)
+        }).then(function (saved) {
+          completedSaveSteps++;
+          saveProgress.update(
+            completedSaveSteps,
+            "Saving issue: " + (issue.title || issue.issue_id)
+          );
+          return saved;
         });
       }));
     }).then(function (savedIssues) {
@@ -2049,6 +2131,9 @@
       });
       state.dirty = false;
       state.pendingActivityLogs = {};
+      state.saveInProgress = false;
+      saveProgress.update(totalSaveSteps, "Project saved successfully");
+      saveProgress.close(500);
       setStatus("Project saved", "success");
       renderBoard();
       return state.chart;
@@ -2124,8 +2209,94 @@
       dialog.querySelector(".vtPmDialog").classList.add("vtPmHistoryDialog");
       setStatus(activities.length + " activity record(s)", "success");
     }).catch(function (error) {
+      state.saveInProgress = false;
+      saveProgress.fail(error.message || "Project save failed");
+      saveProgress.close(1600);
       setStatus(error.message, "error");
     });
+  }
+
+  function openReportsDialog() {
+    if (!state.projectId || !state.chart) {
+      setStatus("Select a PM project first", "warning");
+      return;
+    }
+    var selectedTask = taskMap()[state.selectedTaskId];
+    var numbers = taskNumberMap(state.chart.tasks || []);
+    var selectedLabel = selectedTask
+      ? ((numbers[selectedTask.task_id] || "") + " " + selectedTask.title).trim()
+      : "No task selected";
+    modal("Generate PM report", [
+      '<div class="vtPmField vtPmFieldFull"><label>Report scope</label>',
+        '<label class="vtPmReportOption"><input type="radio" name="pmReportScope" value="task"',
+          selectedTask ? " checked" : " disabled", '> <span><strong>Selected Task Report</strong><small>',
+          escapeHtml(selectedLabel), " and all descendants</small></span></label>",
+        '<label class="vtPmReportOption"><input type="radio" name="pmReportScope" value="project"',
+          selectedTask ? "" : " checked", '> <span><strong>Entire Project Report</strong><small>Complete Gantt, tasks, conditions, issues, and summaries</small></span></label>',
+      "</div>",
+      '<div class="vtPmField"><label>Timeline scale</label><select id="pmReportScale">',
+        '<option value="auto">Auto</option><option value="days">Days</option>',
+        '<option value="weeks">Weeks</option><option value="months">Months</option>',
+        '<option value="years">Years</option></select></div>',
+      '<div class="vtPmField vtPmReportChecks"><label>Sections</label>',
+        '<label class="vtPmCheckboxLabel"><input id="pmReportResolved" type="checkbox" checked> Include resolved issues</label>',
+        '<label class="vtPmCheckboxLabel"><input id="pmReportActivity" type="checkbox" checked> Include activity history</label>',
+      "</div>",
+      '<div class="vtPmValidationMessage vtPmFieldFull" id="pmReportValidation"></div>'
+    ].join(""), function (dialog) {
+      if (state.dirty) {
+        dialog.querySelector("#pmReportValidation").textContent =
+          "Save Project before generating a report so it matches the database.";
+        return false;
+      }
+      var scopeInput = dialog.querySelector('input[name="pmReportScope"]:checked');
+      if (!scopeInput) {
+        dialog.querySelector("#pmReportValidation").textContent = "Choose a report scope.";
+        return false;
+      }
+      var saveButton = dialog.querySelector("[data-modal-save]");
+      saveButton.disabled = true;
+      saveButton.textContent = "Generating...";
+      setStatus("Generating PDF report...", "info");
+      return fetch(API + "/projects/" + encodeURIComponent(state.projectId) + "/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: scopeInput.value,
+          task_id: scopeInput.value === "task" ? state.selectedTaskId : null,
+          include_resolved: dialog.querySelector("#pmReportResolved").checked,
+          include_activity: dialog.querySelector("#pmReportActivity").checked,
+          timeline_scale: dialog.querySelector("#pmReportScale").value
+        })
+      }).then(function (response) {
+        if (!response.ok) {
+          return response.json().catch(function () { return {}; }).then(function (payload) {
+            throw new Error(payload.error || "Report generation failed");
+          });
+        }
+        var disposition = response.headers.get("Content-Disposition") || "";
+        var match = disposition.match(/filename=\"?([^\";]+)\"?/i);
+        return response.blob().then(function (blob) {
+          return { blob: blob, filename: match ? match[1] : "pm_report.pdf" };
+        });
+      }).then(function (result) {
+        var link = document.createElement("a");
+        link.href = URL.createObjectURL(result.blob);
+        link.download = result.filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(function () { URL.revokeObjectURL(link.href); }, 0);
+        setStatus("PDF report generated", "success");
+        return true;
+      }).catch(function (error) {
+        saveButton.disabled = false;
+        saveButton.textContent = "Generate PDF";
+        dialog.querySelector("#pmReportValidation").textContent = error.message;
+        setStatus(error.message, "error");
+        return false;
+      });
+    }, "Generate PDF");
   }
 
   function csvCell(value) {
@@ -2154,7 +2325,7 @@
     link.href = URL.createObjectURL(blob);
     var projectNumber = state.chart && state.chart.project &&
       state.chart.project.project_number || "project";
-    link.download = projectNumber.replace(/[^a-z0-9_-]+/gi, "_") + "_open_issues.csv";
+    link.download = projectNumber.replace(/[^a-z0-9_-]+/gi, "_") + "_project_issues.csv";
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -2163,16 +2334,18 @@
   }
 
   function projectIssueListHtml(issues) {
-    if (!issues.length) return '<div class="vtPmActivityEmpty">There are no open issues for this project.</div>';
+    if (!issues.length) return '<div class="vtPmActivityEmpty">There are no issues for this project.</div>';
     var numbers = taskNumberMap(state.chart && state.chart.tasks || []);
     return issues.map(function (issue) {
       var taskLabel = ((numbers[issue.task_id] || "") + " " + issue.task_title).trim();
+      var resolved = issue.status === "Resolved" || issue.status === "Closed";
       return [
-        '<button type="button" class="vtPmProjectIssueRow" data-project-issue="', escapeHtml(issue.issue_id), '">',
+        '<button type="button" class="vtPmProjectIssueRow', resolved ? " vtPmProjectIssueResolved" : "",
+          '" data-project-issue="', escapeHtml(issue.issue_id), '">',
           '<span><strong>', escapeHtml(issue.title), '</strong><small>', escapeHtml(taskLabel), '</small></span>',
           '<span class="vtPmIssuePriority vtPmIssuePriority', escapeHtml(issue.priority), '">', escapeHtml(issue.priority), '</span>',
           '<span>', escapeHtml(issue.owner || "Unassigned"), '</span>',
-          '<span>', escapeHtml(issue.status), '</span>',
+          '<span>', resolved ? "✅ " : "", escapeHtml(issue.status), '</span>',
           '<span>', escapeHtml(issue.due_date || "No due date"), '</span>',
         '</button>'
       ].join("");
@@ -2184,12 +2357,17 @@
       setStatus("Select a PM project first", "warning");
       return;
     }
-    var issues = (state.issues || []).filter(function (issue) {
-      return issue.status !== "Resolved" && issue.status !== "Closed";
-    });
-      var dialog = modal("Project open issues", [
+    var issues = (state.issues || []).slice();
+    function registerCounts() {
+      var resolved = issues.filter(function (issue) {
+        return issue.status === "Resolved" || issue.status === "Closed";
+      }).length;
+      return { open: issues.length - resolved, resolved: resolved };
+    }
+    var counts = registerCounts();
+      var dialog = modal("Project issues", [
         '<div class="vtPmIssueRegister vtPmFieldFull">',
-          '<div class="vtPmIssueRegisterActions"><strong>', issues.length, ' open issue(s)</strong>',
+          '<div class="vtPmIssueRegisterActions"><strong>', counts.open, ' open · ✅ ', counts.resolved, ' resolved</strong>',
             '<button type="button" class="vtPmBtn vtPmBtnPrimary" data-export-issues>Export File</button></div>',
           '<div class="vtPmProjectIssueHeader"><span>Issue / Task</span><span>Priority</span><span>Owner</span><span>Status</span><span>Due</span></div>',
           '<div class="vtPmProjectIssueList">', projectIssueListHtml(issues), '</div>',
@@ -2209,15 +2387,15 @@
         var task = issue && taskMap()[issue.task_id];
         if (!task) return;
         openIssueDialog(task, issue, function () {
-          issues = (state.issues || []).filter(function (item) {
-            return item.status !== "Resolved" && item.status !== "Closed";
-          });
+          issues = (state.issues || []).slice();
+          counts = registerCounts();
           dialog.querySelector(".vtPmProjectIssueList").innerHTML = projectIssueListHtml(issues);
           dialog.querySelector(".vtPmIssueRegisterActions strong").textContent =
-            issues.length + " open issue(s)";
+            counts.open + " open · ✅ " + counts.resolved + " resolved";
         });
       });
-      setStatus(issues.length + " open issue(s)", issues.length ? "warning" : "success");
+      setStatus(counts.open + " open and " + counts.resolved + " resolved issue(s)",
+        counts.open ? "warning" : "success");
   }
 
   function showConflicts(warnings) {
@@ -2520,6 +2698,7 @@
       if (action === "save") saveChart();
       if (action === "history") openActivityHistory();
       if (action === "issues") openIssuesRegister();
+      if (action === "reports") openReportsDialog();
       if (action === "check-conflicts") checkConflicts();
     });
     state.root.addEventListener("keydown", function (event) {

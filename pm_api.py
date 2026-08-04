@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Callable
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from pm_database import (
     PMDatabase,
@@ -98,6 +98,47 @@ def create_pm_blueprint(
         return jsonify(database().save_issue(
             project_id, request.get_json(silent=True) or {}, issue_id
         ))
+
+    @blueprint.post("/projects/<project_id>/report")
+    def generate_project_report(project_id):
+        from pm_report import build_project_report
+
+        payload = request.get_json(silent=True) or {}
+        db = database()
+        chart = db.get_chart(project_id)
+        resources = {
+            resource["resource_id"]: resource
+            for resource in db.list_resources()
+        }
+        for assignment in chart.get("assignments") or []:
+            resource = resources.get(assignment.get("resource_id"))
+            assignment["resource_name"] = (
+                resource.get("name") if resource else assignment.get("resource_id")
+            )
+        scope = str(payload.get("scope") or "project")
+        task_id = str(payload.get("task_id") or "")
+        if scope == "task" and not any(
+            task.get("task_id") == task_id for task in chart.get("tasks") or []
+        ):
+            raise PMValidationError("select a valid task for a task report")
+        report = build_project_report(
+            chart,
+            db.list_issues(project_id),
+            db.list_activity(project_id),
+            payload,
+        )
+        project_number = str(chart["project"].get("project_number") or "project")
+        suffix = "task_report" if scope == "task" else "project_report"
+        safe_number = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in project_number
+        )
+        return send_file(
+            report,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"{safe_number}_{suffix}.pdf",
+        )
 
     @blueprint.get("/resources")
     def list_resources():

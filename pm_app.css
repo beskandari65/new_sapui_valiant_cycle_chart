@@ -621,6 +621,67 @@ body.vtPmResizingColumn { cursor: col-resize !important; user-select: none !impo
   justify-content: center;
   background: rgba(20, 42, 57, 0.48);
 }
+.vtPmSaveBackdrop { z-index: 10100; }
+.vtPmSaveDialog {
+  width: min(420px, calc(100vw - 32px));
+  overflow: hidden;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 20px 55px rgba(12, 31, 44, .3);
+}
+.vtPmSaveHeader {
+  padding: 13px 17px;
+  background: #f5f7f9;
+  border-bottom: 1px solid #d9dfe7;
+  color: #12344d;
+  font-size: 1rem;
+  font-weight: 700;
+  text-align: center;
+}
+.vtPmSaveBody {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 25px 24px;
+}
+.vtPmSaveBody h3 { margin: 0; color: #23445c; font-size: .95rem; text-align: center; }
+.vtPmSaveBody p { margin: 0; color: #647986; font-size: .75rem; text-align: center; }
+.vtPmSaveProgressTrack {
+  width: 100%;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #e5eaed;
+  box-shadow: inset 0 0 0 1px #cbd5db;
+}
+.vtPmSaveProgressTrack span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: #0a6ed1;
+  transition: width .2s ease;
+}
+.vtPmSaveBackdrop.complete .vtPmSaveProgressTrack span { background: #107e3e; }
+.vtPmSaveBackdrop.failed .vtPmSaveProgressTrack span { background: #bb0000; }
+.vtPmSaveBody > strong { color: #29485d; font-size: .76rem; }
+.vtPmSaveSpinner {
+  width: 27px;
+  height: 27px;
+  border: 3px solid #d9e6ef;
+  border-top-color: #0a6ed1;
+  border-radius: 50%;
+  animation: vtPmSaveSpin .8s linear infinite;
+}
+.vtPmSaveBackdrop.complete .vtPmSaveSpinner {
+  border-color: #107e3e;
+  animation: none;
+}
+.vtPmSaveBackdrop.failed .vtPmSaveSpinner {
+  border-color: #bb0000;
+  animation: none;
+}
+@keyframes vtPmSaveSpin { to { transform: rotate(360deg); } }
 
 .vtPmDialog {
   width: min(560px, calc(100vw - 32px));
@@ -697,6 +758,21 @@ body.vtPmResizingColumn { cursor: col-resize !important; user-select: none !impo
   cursor: pointer;
 }
 .vtPmCheckboxLabel input { width: auto; margin: 0; }
+.vtPmReportOption {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d7e1e8;
+  border-radius: 4px;
+  background: #f8fafb;
+  cursor: pointer;
+}
+.vtPmReportOption input { width: auto; margin-top: 3px; }
+.vtPmReportOption span { display: flex; flex-direction: column; gap: 3px; }
+.vtPmReportOption small { color: #647986; font-weight: 400; }
+.vtPmReportChecks { gap: 9px; }
 #pmTaskLogReasonWrap { margin-top: 10px; }
 #pmTaskLogReasonWrap[hidden] { display: none; }
 #pmTaskLogReasonWrap > label { display: block; margin-bottom: 5px; }
@@ -770,6 +846,11 @@ body.vtPmResizingColumn { cursor: col-resize !important; user-select: none !impo
   cursor: pointer;
 }
 .vtPmProjectIssueRow:hover { background: #f3f8fc; }
+.vtPmProjectIssueResolved {
+  background: #f2faf4;
+  color: #356844;
+}
+.vtPmProjectIssueResolved:hover { background: #e6f5e9; }
 .vtPmProjectIssueRow > span:first-child { display: flex; flex-direction: column; gap: 3px; }
 .vtPmProjectIssueRow small { color: #738591; }
 .vtPmDialogFooter {
